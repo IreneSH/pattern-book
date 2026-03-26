@@ -140,6 +140,9 @@ function getPatternLabel(p, patterns) {
 
 function getDescendantIds(patternId, patterns) {
   const ids = [patternId];
+  patterns.filter(p => p.parentId === patternId).forEach(c => ids.push(...getDescendantIds(c.id, patterns)));
+  return ids;
+}
 
 /* ══════════════════════════════════════════════════════════════
    MAIN APP
