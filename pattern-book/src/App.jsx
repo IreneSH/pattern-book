@@ -178,8 +178,7 @@ function StockDatabook({ userId }) {
         const p = await fsLoadPatterns(userId);
         const ci = await fsLoadCasesIndex(userId);
         if (!done) { setPatterns(p); setCasesIndex(ci); }
-        const store = await fsLoadAllCases(userId);
-        if (!done) setCaseStore(store);
+        // No longer loading all cases upfront - they load on demand
       } catch (e) { console.error("Load error:", e); }
       done = true;
       setLoading(false);
@@ -300,7 +299,6 @@ function StockDatabook({ userId }) {
     if (c) {
       setSelectedCase(c);
     } else {
-      // Fallback: try loading from storage
       fsLoadCase(userId, id).then(loaded => {
         if (loaded) {
           setCaseStore(prev => ({ ...prev, [id]: loaded }));
@@ -309,6 +307,16 @@ function StockDatabook({ userId }) {
       });
     }
   };
+
+  // Load a case on demand and cache it
+  const loadCaseOnDemand = useCallback((id) => {
+    if (caseStore[id]) return; // already cached
+    fsLoadCase(userId, id).then(loaded => {
+      if (loaded) {
+        setCaseStore(prev => ({ ...prev, [id]: loaded }));
+      }
+    });
+  }, [caseStore, userId]);
 
   const getPattern = (id) => patterns.find(p => p.id === id);
   const topPatterns = useMemo(() => patterns.filter(p => !p.parentId), [patterns]);
@@ -346,11 +354,11 @@ function StockDatabook({ userId }) {
       <div style={S.main}>
         {view === VIEWS.DASH && <Dashboard patterns={patterns} casesIndex={casesIndex} goToCases={(pid) => { setSelectedPatternId(pid); setSelectedCase(null); setView(VIEWS.CASES); }} openCase={(id) => { openCase(id); setView(VIEWS.CASES); }} getPattern={getPattern} getChildren={getChildren} />}
         {view === VIEWS.PATTERNS && <PatternsView patterns={patterns} casesIndex={casesIndex} topPatterns={topPatterns} getChildren={getChildren} goToCases={(pid) => { setSelectedPatternId(pid); setSelectedCase(null); setView(VIEWS.CASES); }} onAdd={(parentId) => setPatternModal({ mode: "add", parentId })} onEdit={(p) => setPatternModal({ mode: "edit", pattern: p })} onDelete={deletePatternFn} allMktTags={allMktTags} onDeleteTag={deleteMarketTag} onRenameTag={renameMarketTag} />}
-        {view === VIEWS.CASES && <CasesView patterns={patterns} casesIndex={casesIndex} caseStore={caseStore} selectedPatternId={selectedPatternId} setSelectedPatternId={setSelectedPatternId} selectedCase={selectedCase} setSelectedCase={setSelectedCase} openCase={openCase} getPattern={getPattern} getChildren={getChildren} topPatterns={topPatterns} setLightbox={setLightboxSrc} onEdit={(c) => { setEditingCase(c); setView(VIEWS.EDIT); }} onDelete={deleteCaseFn} onUpdateResult={(c, result) => { const updated = { ...c, result }; setSelectedCase(updated); saveCaseFn(updated); showToast(result === "success" ? "已標記成功" : result === "failure" ? "已標記失敗" : "已設為待觀察"); }} onDeleteTag={(c, type, tag) => { let updated; if (type === "market") { updated = { ...c, marketTags: (c.marketTags || []).filter(t => t !== tag) }; } else { const newNotes = c.notes.replace(new RegExp("#" + tag + "(?=[\\s\\n]|$)", "g"), "").trim(); updated = { ...c, notes: newNotes, tags: extractTags(newNotes) }; } saveCaseFn(updated); setCaseStore(prev => ({ ...prev, [c.id]: updated })); showToast("已刪除標籤"); }} />}
+        {view === VIEWS.CASES && <CasesView patterns={patterns} casesIndex={casesIndex} caseStore={caseStore} loadCase={loadCaseOnDemand} selectedPatternId={selectedPatternId} setSelectedPatternId={setSelectedPatternId} selectedCase={selectedCase} setSelectedCase={setSelectedCase} openCase={openCase} getPattern={getPattern} getChildren={getChildren} topPatterns={topPatterns} setLightbox={setLightboxSrc} onEdit={(c) => { setEditingCase(c); setView(VIEWS.EDIT); }} onDelete={deleteCaseFn} onUpdateResult={(c, result) => { const updated = { ...c, result }; setSelectedCase(updated); saveCaseFn(updated); showToast(result === "success" ? "已標記成功" : result === "failure" ? "已標記失敗" : "已設為待觀察"); }} onDeleteTag={(c, type, tag) => { let updated; if (type === "market") { updated = { ...c, marketTags: (c.marketTags || []).filter(t => t !== tag) }; } else { const newNotes = c.notes.replace(new RegExp("#" + tag + "(?=[\\s\\n]|$)", "g"), "").trim(); updated = { ...c, notes: newNotes, tags: extractTags(newNotes) }; } saveCaseFn(updated); setCaseStore(prev => ({ ...prev, [c.id]: updated })); showToast("已刪除標籤"); }} />}
         {view === VIEWS.ADD && <CaseForm patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} allMktTags={allMktTags} onSave={(c) => { saveCaseFn(c); showToast("✓ 新增成功！"); }} onCancel={() => setView(VIEWS.DASH)} />}
         {view === VIEWS.EDIT && editingCase && <CaseForm patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} allMktTags={allMktTags} existing={editingCase} onSave={(c) => { saveCaseFn(c); setSelectedCase(c); showToast("✓ 更新成功"); setView(VIEWS.CASES); }} onCancel={() => setView(VIEWS.CASES)} />}
         {view === VIEWS.STATS && <StatsView patterns={patterns} casesIndex={casesIndex} topPatterns={topPatterns} getChildren={getChildren} allMktTags={allMktTags} />}
-        {view === VIEWS.SEARCH && <SearchView casesIndex={casesIndex} caseStore={caseStore} getPattern={getPattern} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} allMktTags={allMktTags} setLightbox={setLightboxSrc} />}
+        {view === VIEWS.SEARCH && <SearchView casesIndex={casesIndex} caseStore={caseStore} loadCase={loadCaseOnDemand} getPattern={getPattern} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} allMktTags={allMktTags} setLightbox={setLightboxSrc} />}
       </div>
 
       {patternModal && <PatternModal existing={patternModal.mode === "edit" ? patternModal.pattern : null} parentId={patternModal.parentId || null} patterns={patterns} topPatterns={topPatterns} onSave={savePatternFn} onClose={() => setPatternModal(null)} />}
@@ -611,7 +619,7 @@ function PatternModal({ existing, parentId, patterns, topPatterns, onSave, onClo
 /* ══════════════════════════════════════════════════════════════
    CASES BROWSE — Split View
    ══════════════════════════════════════════════════════════════ */
-function CasesView({ patterns, casesIndex, caseStore, selectedPatternId, setSelectedPatternId, selectedCase, setSelectedCase, openCase, getPattern, getChildren, topPatterns, setLightbox, onEdit, onDelete, onUpdateResult, onDeleteTag }) {
+function CasesView({ patterns, casesIndex, caseStore, loadCase, selectedPatternId, setSelectedPatternId, selectedCase, setSelectedCase, openCase, getPattern, getChildren, topPatterns, setLightbox, onEdit, onDelete, onUpdateResult, onDeleteTag }) {
   const [resultFilter, setResultFilter] = useState("all");
   const [tagFilter, setTagFilter] = useState("");
   const [sortBy, setSortBy] = useState("newest");
@@ -651,6 +659,13 @@ function CasesView({ patterns, casesIndex, caseStore, selectedPatternId, setSele
   const currentEntry = filtered[safeIdx];
   const currentFull = currentEntry ? caseStore[currentEntry.id] : null;
   const currentPat = currentEntry ? getPattern(currentEntry.patternId) : null;
+
+  // Lazy load current case when slideshow index changes
+  useEffect(() => {
+    if (currentEntry && !caseStore[currentEntry.id]) {
+      loadCase(currentEntry.id);
+    }
+  }, [currentEntry?.id]);
 
   const goSlide = (dir) => {
     const next = safeIdx + dir;
@@ -758,6 +773,9 @@ function CasesView({ patterns, casesIndex, caseStore, selectedPatternId, setSele
                 </div>
 
                 {/* Full-width chart images */}
+                {!currentFull && (
+                  <div style={{ ...S.card, padding: 30, textAlign: "center", color: "#94A3B8" }}>載入中...</div>
+                )}
                 {currentFull && currentFull.images && currentFull.images.length > 0 && (
                   <div style={{ ...S.card, padding: 14 }}>
                     {currentFull.images.map((img, i) => (
@@ -1349,7 +1367,7 @@ function StatsView({ patterns, casesIndex, topPatterns, getChildren, allMktTags 
 /* ══════════════════════════════════════════════════════════════
    SEARCH
    ══════════════════════════════════════════════════════════════ */
-function SearchView({ casesIndex, caseStore, getPattern, patterns, topPatterns, getChildren, allMktTags, setLightbox }) {
+function SearchView({ casesIndex, caseStore, loadCase, getPattern, patterns, topPatterns, getChildren, allMktTags, setLightbox }) {
   const [q, setQ] = useState("");
   const [patFilter, setPatFilter] = useState("");
   const [mktFilter, setMktFilter] = useState("");
@@ -1388,6 +1406,13 @@ function SearchView({ casesIndex, caseStore, getPattern, patterns, topPatterns, 
   const currentEntry = results[safeIdx];
   const currentFull = currentEntry ? caseStore[currentEntry.id] : null;
   const currentPat = currentEntry ? getPattern(currentEntry.patternId) : null;
+
+  // Lazy load current case
+  useEffect(() => {
+    if (currentEntry && !caseStore[currentEntry.id]) {
+      loadCase(currentEntry.id);
+    }
+  }, [currentEntry?.id]);
 
   return (
     <div>
@@ -1464,6 +1489,9 @@ function SearchView({ casesIndex, caseStore, getPattern, patterns, topPatterns, 
                   </div>
                 </div>
 
+                {!currentFull && (
+                  <div style={{ ...S.card, padding: 30, textAlign: "center", color: "#94A3B8" }}>載入中...</div>
+                )}
                 {currentFull && currentFull.images && currentFull.images.length > 0 && (
                   <div style={{ ...S.card, padding: 14 }}>
                     {currentFull.images.map((img, i) => (
