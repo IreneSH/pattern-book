@@ -246,6 +246,55 @@ function StockDatabook({ userId }) {
     showToast("已刪除");
   };
 
+  // Tag management: delete a market tag from ALL cases
+  const deleteMarketTag = (tagToDelete) => {
+    const newIdx = casesIndex.map(c => {
+      if ((c.marketTags || []).includes(tagToDelete)) {
+        return { ...c, marketTags: c.marketTags.filter(t => t !== tagToDelete) };
+      }
+      return c;
+    });
+    setCasesIndex(newIdx);
+    fsSaveCasesIndex(userId, newIdx);
+    // Also update full case store
+    const newStore = { ...caseStore };
+    Object.keys(newStore).forEach(id => {
+      const c = newStore[id];
+      if ((c.marketTags || []).includes(tagToDelete)) {
+        newStore[id] = { ...c, marketTags: c.marketTags.filter(t => t !== tagToDelete) };
+        fsSaveCase(userId, newStore[id]);
+      }
+    });
+    setCaseStore(newStore);
+    showToast(`已刪除標籤「${tagToDelete}」`);
+  };
+
+  // Tag management: rename a market tag across ALL cases
+  const renameMarketTag = (oldTag, newTag) => {
+    if (!newTag.trim() || oldTag === newTag.trim()) return;
+    const nt = newTag.trim();
+    const newIdx = casesIndex.map(c => {
+      if ((c.marketTags || []).includes(oldTag)) {
+        const tags = c.marketTags.map(t => t === oldTag ? nt : t);
+        return { ...c, marketTags: [...new Set(tags)] };
+      }
+      return c;
+    });
+    setCasesIndex(newIdx);
+    fsSaveCasesIndex(userId, newIdx);
+    const newStore = { ...caseStore };
+    Object.keys(newStore).forEach(id => {
+      const c = newStore[id];
+      if ((c.marketTags || []).includes(oldTag)) {
+        const tags = c.marketTags.map(t => t === oldTag ? nt : t);
+        newStore[id] = { ...c, marketTags: [...new Set(tags)] };
+        fsSaveCase(userId, newStore[id]);
+      }
+    });
+    setCaseStore(newStore);
+    showToast(`已將「${oldTag}」改為「${nt}」`);
+  };
+
   const openCase = (id) => {
     const c = caseStore[id];
     if (c) {
@@ -296,8 +345,8 @@ function StockDatabook({ userId }) {
 
       <div style={S.main}>
         {view === VIEWS.DASH && <Dashboard patterns={patterns} casesIndex={casesIndex} goToCases={(pid) => { setSelectedPatternId(pid); setSelectedCase(null); setView(VIEWS.CASES); }} openCase={(id) => { openCase(id); setView(VIEWS.CASES); }} getPattern={getPattern} getChildren={getChildren} />}
-        {view === VIEWS.PATTERNS && <PatternsView patterns={patterns} casesIndex={casesIndex} topPatterns={topPatterns} getChildren={getChildren} goToCases={(pid) => { setSelectedPatternId(pid); setSelectedCase(null); setView(VIEWS.CASES); }} onAdd={(parentId) => setPatternModal({ mode: "add", parentId })} onEdit={(p) => setPatternModal({ mode: "edit", pattern: p })} onDelete={deletePatternFn} />}
-        {view === VIEWS.CASES && <CasesView patterns={patterns} casesIndex={casesIndex} caseStore={caseStore} selectedPatternId={selectedPatternId} setSelectedPatternId={setSelectedPatternId} selectedCase={selectedCase} setSelectedCase={setSelectedCase} openCase={openCase} getPattern={getPattern} getChildren={getChildren} topPatterns={topPatterns} setLightbox={setLightboxSrc} onEdit={(c) => { setEditingCase(c); setView(VIEWS.EDIT); }} onDelete={deleteCaseFn} onUpdateResult={(c, result) => { const updated = { ...c, result }; setSelectedCase(updated); saveCaseFn(updated); showToast(result === "success" ? "已標記成功" : result === "failure" ? "已標記失敗" : "已設為待觀察"); }} />}
+        {view === VIEWS.PATTERNS && <PatternsView patterns={patterns} casesIndex={casesIndex} topPatterns={topPatterns} getChildren={getChildren} goToCases={(pid) => { setSelectedPatternId(pid); setSelectedCase(null); setView(VIEWS.CASES); }} onAdd={(parentId) => setPatternModal({ mode: "add", parentId })} onEdit={(p) => setPatternModal({ mode: "edit", pattern: p })} onDelete={deletePatternFn} allMktTags={allMktTags} onDeleteTag={deleteMarketTag} onRenameTag={renameMarketTag} />}
+        {view === VIEWS.CASES && <CasesView patterns={patterns} casesIndex={casesIndex} caseStore={caseStore} selectedPatternId={selectedPatternId} setSelectedPatternId={setSelectedPatternId} selectedCase={selectedCase} setSelectedCase={setSelectedCase} openCase={openCase} getPattern={getPattern} getChildren={getChildren} topPatterns={topPatterns} setLightbox={setLightboxSrc} onEdit={(c) => { setEditingCase(c); setView(VIEWS.EDIT); }} onDelete={deleteCaseFn} onUpdateResult={(c, result) => { const updated = { ...c, result }; setSelectedCase(updated); saveCaseFn(updated); showToast(result === "success" ? "已標記成功" : result === "failure" ? "已標記失敗" : "已設為待觀察"); }} onDeleteTag={(c, type, tag) => { let updated; if (type === "market") { updated = { ...c, marketTags: (c.marketTags || []).filter(t => t !== tag) }; } else { const newNotes = c.notes.replace(new RegExp("#" + tag + "(?=[\\s\\n]|$)", "g"), "").trim(); updated = { ...c, notes: newNotes, tags: extractTags(newNotes) }; } saveCaseFn(updated); setCaseStore(prev => ({ ...prev, [c.id]: updated })); showToast("已刪除標籤"); }} />}
         {view === VIEWS.ADD && <CaseForm patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} allMktTags={allMktTags} onSave={(c) => { saveCaseFn(c); showToast("✓ 新增成功！"); }} onCancel={() => setView(VIEWS.DASH)} />}
         {view === VIEWS.EDIT && editingCase && <CaseForm patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} allMktTags={allMktTags} existing={editingCase} onSave={(c) => { saveCaseFn(c); setSelectedCase(c); showToast("✓ 更新成功"); setView(VIEWS.CASES); }} onCancel={() => setView(VIEWS.CASES)} />}
         {view === VIEWS.STATS && <StatsView patterns={patterns} casesIndex={casesIndex} topPatterns={topPatterns} getChildren={getChildren} allMktTags={allMktTags} />}
@@ -398,7 +447,10 @@ function Dashboard({ patterns, casesIndex, goToCases, openCase, getPattern, getC
 /* ══════════════════════════════════════════════════════════════
    PATTERNS MANAGEMENT
    ══════════════════════════════════════════════════════════════ */
-function PatternsView({ patterns, casesIndex, topPatterns, getChildren, goToCases, onAdd, onEdit, onDelete }) {
+function PatternsView({ patterns, casesIndex, topPatterns, getChildren, goToCases, onAdd, onEdit, onDelete, allMktTags, onDeleteTag, onRenameTag }) {
+  const [editingTag, setEditingTag] = useState(null);
+  const [editTagValue, setEditTagValue] = useState("");
+
   return (
     <div>
       <div style={S.flexBetween}>
@@ -460,6 +512,35 @@ function PatternsView({ patterns, casesIndex, topPatterns, getChildren, goToCase
               </div>
             );
           })}
+        </div>
+      )}
+
+      {/* Market Tag Management */}
+      {allMktTags.length > 0 && (
+        <div style={{ ...S.card, marginTop: 20 }}>
+          <div style={S.h3}>市場標籤管理</div>
+          <div style={{ fontSize: 12, color: "#94A3B8", marginBottom: 12 }}>刪除或重新命名標籤，會套用到所有使用該標籤的案例</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {allMktTags.map(tag => (
+              <div key={tag} style={{ ...S.flexBetween, padding: "8px 12px", borderRadius: 7, background: "#FAFBFD" }}>
+                {editingTag === tag ? (
+                  <div style={S.flexGap(6)}>
+                    <input style={{ ...S.input, width: 200, padding: "4px 8px" }} value={editTagValue} onChange={e => setEditTagValue(e.target.value)} autoFocus onKeyDown={e => { if (e.key === "Enter") { onRenameTag(tag, editTagValue); setEditingTag(null); } }} />
+                    <button style={{ ...S.btn(), padding: "4px 10px", fontSize: 11 }} onClick={() => { onRenameTag(tag, editTagValue); setEditingTag(null); }}>確認</button>
+                    <button style={{ ...S.btnOutline, padding: "4px 10px", fontSize: 11 }} onClick={() => setEditingTag(null)}>取消</button>
+                  </div>
+                ) : (
+                  <span style={S.tag("#FEF3C7", "#92400E")}>📌 {tag}</span>
+                )}
+                {editingTag !== tag && (
+                  <div style={S.flexGap(4)}>
+                    <button style={{ ...S.btnOutline, padding: "3px 8px", fontSize: 11 }} onClick={() => { setEditingTag(tag); setEditTagValue(tag); }}>重新命名</button>
+                    <button style={{ ...S.btnOutline, padding: "3px 8px", fontSize: 11, color: "#EF4444", borderColor: "#FECACA" }} onClick={() => onDeleteTag(tag)}>刪除</button>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
         </div>
       )}
     </div>
@@ -530,7 +611,7 @@ function PatternModal({ existing, parentId, patterns, topPatterns, onSave, onClo
 /* ══════════════════════════════════════════════════════════════
    CASES BROWSE — Split View
    ══════════════════════════════════════════════════════════════ */
-function CasesView({ patterns, casesIndex, caseStore, selectedPatternId, setSelectedPatternId, selectedCase, setSelectedCase, openCase, getPattern, getChildren, topPatterns, setLightbox, onEdit, onDelete, onUpdateResult }) {
+function CasesView({ patterns, casesIndex, caseStore, selectedPatternId, setSelectedPatternId, selectedCase, setSelectedCase, openCase, getPattern, getChildren, topPatterns, setLightbox, onEdit, onDelete, onUpdateResult, onDeleteTag }) {
   const [resultFilter, setResultFilter] = useState("all");
   const [tagFilter, setTagFilter] = useState("");
   const [sortBy, setSortBy] = useState("newest");
@@ -705,13 +786,17 @@ function CasesView({ patterns, casesIndex, caseStore, selectedPatternId, setSele
                 )}
 
                 {/* Market context */}
-                {currentFull && currentFull.marketContext && (
+                {currentFull && (currentFull.marketContext || (currentFull.marketTags || []).length > 0) && (
                   <div style={{ ...S.card, padding: 14 }}>
                     <div style={S.h3}>市場狀態</div>
                     {(currentFull.marketTags || []).length > 0 && (
-                      <div style={{ marginBottom: 8 }}>{currentFull.marketTags.map(t => <span key={t} style={S.tag("#FEF3C7", "#92400E")}>📌 {t}</span>)}</div>
+                      <div style={{ marginBottom: 8 }}>{currentFull.marketTags.map(t =>
+                        <span key={t} style={{ ...S.tag("#FEF3C7", "#92400E"), cursor: "pointer" }}
+                          onClick={() => onDeleteTag(currentFull, "market", t)}
+                          title="點擊刪除此標籤">📌 {t} ✕</span>
+                      )}</div>
                     )}
-                    <div style={{ fontSize: 13, lineHeight: 1.7, whiteSpace: "pre-wrap", color: "#475569" }}>{currentFull.marketContext}</div>
+                    {currentFull.marketContext && <div style={{ fontSize: 13, lineHeight: 1.7, whiteSpace: "pre-wrap", color: "#475569" }}>{currentFull.marketContext}</div>}
                   </div>
                 )}
 
@@ -925,7 +1010,7 @@ function CaseForm({ patterns, topPatterns, getChildren, allMktTags, existing, on
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12 }}>
               <div>
                 <label style={S.label}>股票代碼 *</label>
-                <input style={S.input} value={form.ticker} onChange={e => set("ticker", e.target.value)} placeholder="例：AAPL, 2330.TW, POWL US" />
+                <input style={S.input} value={form.ticker} onChange={e => set("ticker", e.target.value)} placeholder="例：AAPL, 2330.TW, NVDA US" />
               </div>
               <div>
                 <label style={S.label}>型態分類 *</label>
@@ -1087,10 +1172,16 @@ function StatsView({ patterns, casesIndex, topPatterns, getChildren, allMktTags 
     const map = {};
     filtered.forEach(c => {
       (c.marketTags || []).forEach(t => {
-        if (!map[t]) map[t] = { tag: t, total: 0, success: 0, failure: 0 };
+        if (!map[t]) map[t] = { tag: t, total: 0, success: 0, failure: 0, byPattern: {} };
         map[t].total++;
         if (c.result === "success") map[t].success++;
         if (c.result === "failure") map[t].failure++;
+        // Per-pattern breakdown
+        const pId = c.patternId;
+        if (!map[t].byPattern[pId]) map[t].byPattern[pId] = { total: 0, success: 0, failure: 0 };
+        map[t].byPattern[pId].total++;
+        if (c.result === "success") map[t].byPattern[pId].success++;
+        if (c.result === "failure") map[t].byPattern[pId].failure++;
       });
     });
     return Object.values(map).sort((a, b) => {
@@ -1187,21 +1278,48 @@ function StatsView({ patterns, casesIndex, topPatterns, getChildren, allMktTags 
         </div>
 
         <div style={S.card}>
-          <div style={S.h3}>各市場狀態下的勝率</div>
+          <div style={S.h3}>各市場狀態下，各型態的勝率</div>
           {byMktTag.length === 0 ? <div style={{ color: "#CBD5E1", fontSize: 12 }}>無資料</div> : (
-            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12.5 }}>
-              <thead><tr style={{ borderBottom: "1px solid #E2E8F0" }}><TH>市場狀態</TH><TH align="center">案例</TH><TH align="center">勝/負</TH><TH>勝率</TH></tr></thead>
-              <tbody>
-                {byMktTag.map(m => (
-                  <tr key={m.tag} style={{ borderBottom: "1px solid #F1F5F9" }}>
-                    <td style={{ padding: "8px 6px" }}><span style={S.tag("#FEF3C7", "#92400E")}>📌 {m.tag}</span></td>
-                    <td style={{ textAlign: "center", padding: "8px 6px" }}>{m.total}</td>
-                    <td style={{ textAlign: "center", padding: "8px 6px" }}>{m.success}/{m.failure}</td>
-                    <td style={{ padding: "8px 6px" }}><WinBar s={m.success} f={m.failure} /></td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              {byMktTag.map(m => {
+                const mDec = m.success + m.failure;
+                const patEntries = Object.entries(m.byPattern).map(([pId, data]) => {
+                  const p = patterns.find(x => x.id === pId);
+                  return { pId, name: p ? getPatternLabel(p, patterns) : "—", color: p ? p.color : "#CBD5E1", ...data };
+                }).filter(x => x.total > 0).sort((a, b) => b.total - a.total);
+                return (
+                  <div key={m.tag} style={{ background: "#FAFBFD", borderRadius: 8, padding: 12 }}>
+                    <div style={S.flexBetween}>
+                      <span style={S.tag("#FEF3C7", "#92400E")}>📌 {m.tag}</span>
+                      <span style={{ fontSize: 12, color: "#94A3B8" }}>{m.total} 筆 · {mDec > 0 ? `${m.success}勝${m.failure}負 · 勝率 ${pct(m.success, mDec)}` : "—"}</span>
+                    </div>
+                    {patEntries.length > 0 && (
+                      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, marginTop: 8 }}>
+                        <thead><tr style={{ borderBottom: "1px solid #E2E8F0" }}>
+                          <th style={{ textAlign: "left", padding: "5px 6px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>型態</th>
+                          <th style={{ textAlign: "center", padding: "5px 6px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>案例</th>
+                          <th style={{ textAlign: "center", padding: "5px 6px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>勝/負</th>
+                          <th style={{ padding: "5px 6px", color: "#94A3B8", fontWeight: 500, fontSize: 11, minWidth: 80 }}>勝率</th>
+                        </tr></thead>
+                        <tbody>
+                          {patEntries.map(pe => {
+                            const d = pe.success + pe.failure;
+                            return (
+                              <tr key={pe.pId} style={{ borderBottom: "1px solid #F1F5F9" }}>
+                                <td style={{ padding: "6px" }}><div style={S.flexGap(5)}><Dot color={pe.color} size={7} />{pe.name}</div></td>
+                                <td style={{ textAlign: "center", padding: "6px" }}>{pe.total}</td>
+                                <td style={{ textAlign: "center", padding: "6px" }}>{pe.success}/{pe.failure}</td>
+                                <td style={{ padding: "6px" }}>{d > 0 ? <WinBar s={pe.success} f={pe.failure} /> : <span style={{ color: "#CBD5E1" }}>—</span>}</td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
           )}
         </div>
       </div>
@@ -1235,7 +1353,7 @@ function SearchView({ casesIndex, caseStore, getPattern, patterns, topPatterns, 
   const [q, setQ] = useState("");
   const [patFilter, setPatFilter] = useState("");
   const [mktFilter, setMktFilter] = useState("");
-  const [viewingId, setViewingId] = useState(null); // case id being viewed
+  const [viewIdx, setViewIdx] = useState(0);
 
   const patternOptions = useMemo(() => {
     const opts = [];
@@ -1248,16 +1366,13 @@ function SearchView({ casesIndex, caseStore, getPattern, patterns, topPatterns, 
 
   const results = useMemo(() => {
     let list = casesIndex;
-    // Pattern filter
     if (patFilter) {
       const allIds = getDescendantIds(patFilter, patterns);
       list = list.filter(c => allIds.includes(c.patternId));
     }
-    // Market tag filter
     if (mktFilter) {
       list = list.filter(c => (c.marketTags || []).includes(mktFilter));
     }
-    // Text search
     if (q.trim()) {
       const lower = q.toLowerCase();
       list = list.filter(c => {
@@ -1268,82 +1383,24 @@ function SearchView({ casesIndex, caseStore, getPattern, patterns, topPatterns, 
     return list;
   }, [q, patFilter, mktFilter, casesIndex, patterns]);
 
-  const viewingCase = viewingId ? caseStore[viewingId] : null;
-  const viewingPat = viewingCase ? getPattern(viewingCase.patternId) : null;
-
-  // If viewing a case, show detail with back button
-  if (viewingCase) {
-    const tags = viewingCase.tags || extractTags(viewingCase.notes || "");
-    const mTags = viewingCase.marketTags || [];
-    return (
-      <div>
-        <button style={{ ...S.btnOutline, marginBottom: 14 }} onClick={() => setViewingId(null)}>
-          <Icon name="back" size={14} /> 返回搜尋結果
-        </button>
-
-        <div style={{ ...S.card, padding: 14 }}>
-          <div style={S.flexBetween}>
-            <div style={S.flexGap(10)}>
-              {viewingPat && <Dot color={viewingPat.color} size={12} />}
-              <span style={{ fontWeight: 700, fontSize: 18 }}>{viewingCase.ticker}</span>
-              {viewingPat && <span style={S.tag(viewingPat.color + "22", viewingPat.color)}>{getPatternLabel(viewingPat, patterns)}</span>}
-              <span style={S.badge(viewingCase.result)}>{viewingCase.result === "success" ? "✓ 成功" : viewingCase.result === "failure" ? "✗ 失敗" : "⏳ 待觀察"}</span>
-            </div>
-          </div>
-          <div style={{ marginTop: 6, ...S.flexGap(12), fontSize: 12, color: "#94A3B8", flexWrap: "wrap" }}>
-            <span>型態日期：{fmt(viewingCase.patternDate)}</span>
-            <span>記錄：{fmt(viewingCase.createdAt)}</span>
-            {tags.map(t => <span key={t} style={S.tag()}>#{t}</span>)}
-          </div>
-        </div>
-
-        {viewingCase.images && viewingCase.images.length > 0 && (
-          <div style={{ ...S.card, padding: 14 }}>
-            {viewingCase.images.map((img, i) => (
-              <img key={i} src={img} alt="" style={{ width: "100%", borderRadius: 7, objectFit: "contain", border: "1px solid #E2E8F0", cursor: "pointer", marginBottom: i < viewingCase.images.length - 1 ? 10 : 0, maxHeight: 400 }} onClick={() => setLightbox(img)} />
-            ))}
-          </div>
-        )}
-
-        {viewingCase.notes && (
-          <div style={{ ...S.card, padding: 14 }}>
-            <div style={S.h3}>筆記</div>
-            <div style={{ fontSize: 13, lineHeight: 1.7, whiteSpace: "pre-wrap", color: "#334155" }}>
-              {viewingCase.notes.split(/(#[\w\u4e00-\u9fff\u3400-\u4dbf]+)/g).map((part, i) =>
-                part.match(/^#[\w\u4e00-\u9fff\u3400-\u4dbf]+$/) ?
-                  <span key={i} style={{ color: "#4F46E5", fontWeight: 600, background: "#EEF2FF", padding: "1px 4px", borderRadius: 3 }}>{part}</span> :
-                  <span key={i}>{part}</span>
-              )}
-            </div>
-          </div>
-        )}
-
-        {viewingCase.marketContext && (
-          <div style={{ ...S.card, padding: 14 }}>
-            <div style={S.h3}>市場狀態</div>
-            {mTags.length > 0 && <div style={{ marginBottom: 8 }}>{mTags.map(t => <span key={t} style={S.tag("#FEF3C7", "#92400E")}>📌 {t}</span>)}</div>}
-            <div style={{ fontSize: 13, lineHeight: 1.7, whiteSpace: "pre-wrap", color: "#475569" }}>{viewingCase.marketContext}</div>
-          </div>
-        )}
-      </div>
-    );
-  }
-
-  // Search results list
   const hasAnyFilter = q.trim() || patFilter || mktFilter;
+  const safeIdx = Math.min(viewIdx, Math.max(0, results.length - 1));
+  const currentEntry = results[safeIdx];
+  const currentFull = currentEntry ? caseStore[currentEntry.id] : null;
+  const currentPat = currentEntry ? getPattern(currentEntry.patternId) : null;
 
   return (
     <div>
       <div style={S.h1}>搜尋</div>
       <div style={S.sub}>搜尋股票代碼、筆記內容、標籤</div>
 
-      {/* Filter row: pattern + market tag */}
+      {/* Filter row */}
       <div style={{ ...S.flexGap(10), flexWrap: "wrap", marginBottom: 10 }}>
-        <select style={{ ...S.select, width: "auto", minWidth: 140 }} value={patFilter} onChange={e => setPatFilter(e.target.value)}>
+        <select style={{ ...S.select, width: "auto", minWidth: 140 }} value={patFilter} onChange={e => { setPatFilter(e.target.value); setViewIdx(0); }}>
           <option value="">所有型態</option>
           {patternOptions.map(o => <option key={o.id} value={o.id}>{o.label}</option>)}
         </select>
-        <select style={{ ...S.select, width: "auto", minWidth: 140 }} value={mktFilter} onChange={e => setMktFilter(e.target.value)}>
+        <select style={{ ...S.select, width: "auto", minWidth: 140 }} value={mktFilter} onChange={e => { setMktFilter(e.target.value); setViewIdx(0); }}>
           <option value="">所有市場狀態</option>
           {allMktTags.map(t => <option key={t} value={t}>📌 {t}</option>)}
         </select>
@@ -1352,37 +1409,96 @@ function SearchView({ casesIndex, caseStore, getPattern, patterns, topPatterns, 
         )}
       </div>
 
-      {/* Text search */}
-      <input style={{ ...S.input, fontSize: 14, padding: "11px 14px", marginBottom: 14 }} value={q} onChange={e => setQ(e.target.value)} placeholder="輸入關鍵字搜尋代碼、筆記、標籤..." autoFocus />
+      <input style={{ ...S.input, fontSize: 14, padding: "11px 14px", marginBottom: 14 }} value={q} onChange={e => { setQ(e.target.value); setViewIdx(0); }} placeholder="輸入關鍵字搜尋代碼、筆記、標籤..." autoFocus />
 
-      {hasAnyFilter && <div style={{ fontSize: 12.5, color: "#94A3B8", marginBottom: 10 }}>找到 {results.length} 筆結果</div>}
+      {hasAnyFilter && <div style={{ fontSize: 12.5, color: "#94A3B8", marginBottom: 10 }}>找到 {results.length} 筆結果{results.length > 0 ? ` · 第 ${safeIdx + 1} / ${results.length} 筆` : ""}</div>}
 
-      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-        {results.map(c => {
-          const p = getPattern(c.patternId);
-          const full = caseStore[c.id];
-          return (
-            <div key={c.id} style={{ ...S.card, cursor: "pointer", padding: 14 }} onClick={() => setViewingId(c.id)}>
-              <div style={S.flexBetween}>
-                <div style={S.flexGap(8)}>
-                  {p && <Dot color={p.color} />}
-                  <span style={{ fontWeight: 700, fontSize: 13 }}>{c.ticker}</span>
-                  {p && <span style={S.tag(p.color + "22", p.color)}>{getPatternLabel(p, patterns)}</span>}
+      {hasAnyFilter && results.length > 0 && (
+        <div style={{ display: "flex", gap: 14, alignItems: "flex-start" }}>
+          {/* Left: compact list */}
+          <div style={{ width: 200, minWidth: 200, maxHeight: "calc(100vh - 300px)", overflowY: "auto", display: "flex", flexDirection: "column", gap: 4 }}>
+            {results.map((c, idx) => {
+              const p = getPattern(c.patternId);
+              const isActive = idx === safeIdx;
+              return (
+                <div key={c.id} style={{
+                  padding: "8px 10px", borderRadius: 7, cursor: "pointer",
+                  background: isActive ? "#EEF2FF" : "#FFF",
+                  border: isActive ? "2px solid #4F46E5" : "1px solid #E8ECF1"
+                }} onClick={() => setViewIdx(idx)}>
+                  <div style={S.flexBetween}>
+                    <div style={S.flexGap(5)}>
+                      {p && <Dot color={p.color} size={8} />}
+                      <span style={{ fontWeight: 600, fontSize: 12 }}>{c.ticker}</span>
+                    </div>
+                    <span style={S.badge(c.result)}>{c.result === "success" ? "成功" : c.result === "failure" ? "失敗" : "觀察"}</span>
+                  </div>
+                  {p && <div style={{ marginTop: 2, fontSize: 10, color: p.color }}>{getPatternLabel(p, patterns)}</div>}
+                  <div style={{ marginTop: 2, fontSize: 10, color: "#CBD5E1" }}>{fmt(c.patternDate || c.createdAt)}</div>
                 </div>
-                <span style={S.badge(c.result)}>{c.result === "success" ? "成功" : c.result === "failure" ? "失敗" : "待觀察"}</span>
+              );
+            })}
+          </div>
+
+          {/* Right: slideshow */}
+          <div style={{ flex: 1, maxHeight: "calc(100vh - 300px)", overflowY: "auto" }}>
+            {currentEntry && (
+              <div>
+                <div style={{ ...S.card, padding: 14 }}>
+                  <div style={S.flexBetween}>
+                    <div style={S.flexGap(10)}>
+                      {currentPat && <Dot color={currentPat.color} size={12} />}
+                      <span style={{ fontWeight: 700, fontSize: 18 }}>{currentEntry.ticker}</span>
+                      {currentPat && <span style={S.tag(currentPat.color + "22", currentPat.color)}>{getPatternLabel(currentPat, patterns)}</span>}
+                      <span style={S.badge(currentEntry.result)}>{currentEntry.result === "success" ? "✓ 成功" : currentEntry.result === "failure" ? "✗ 失敗" : "⏳ 待觀察"}</span>
+                    </div>
+                    <div style={S.flexGap(6)}>
+                      <button style={{ ...S.btnOutline, padding: "6px 12px", fontSize: 16, fontWeight: 700 }} onClick={() => { if (safeIdx > 0) setViewIdx(safeIdx - 1); }} disabled={safeIdx === 0}>←</button>
+                      <span style={{ fontSize: 12, color: "#94A3B8", minWidth: 50, textAlign: "center" }}>{safeIdx + 1} / {results.length}</span>
+                      <button style={{ ...S.btnOutline, padding: "6px 12px", fontSize: 16, fontWeight: 700 }} onClick={() => { if (safeIdx < results.length - 1) setViewIdx(safeIdx + 1); }} disabled={safeIdx === results.length - 1}>→</button>
+                    </div>
+                  </div>
+                  <div style={{ marginTop: 6, ...S.flexGap(12), fontSize: 12, color: "#94A3B8" }}>
+                    <span>型態日期：{fmt(currentEntry.patternDate)}</span>
+                    <span>記錄：{fmt(currentEntry.createdAt)}</span>
+                  </div>
+                </div>
+
+                {currentFull && currentFull.images && currentFull.images.length > 0 && (
+                  <div style={{ ...S.card, padding: 14 }}>
+                    {currentFull.images.map((img, i) => (
+                      <img key={i} src={img} alt="" style={{ width: "100%", borderRadius: 7, objectFit: "contain", border: "1px solid #E2E8F0", cursor: "pointer", marginBottom: i < currentFull.images.length - 1 ? 10 : 0, maxHeight: 400 }} onClick={() => setLightbox(img)} />
+                    ))}
+                  </div>
+                )}
+
+                {currentFull && currentFull.notes && (
+                  <div style={{ ...S.card, padding: 14 }}>
+                    <div style={S.h3}>筆記</div>
+                    <div style={{ fontSize: 13, lineHeight: 1.7, whiteSpace: "pre-wrap", color: "#334155" }}>
+                      {currentFull.notes.split(/(#[\w\u4e00-\u9fff\u3400-\u4dbf]+)/g).map((part, i) =>
+                        part.match(/^#[\w\u4e00-\u9fff\u3400-\u4dbf]+$/) ?
+                          <span key={i} style={{ color: "#4F46E5", fontWeight: 600, background: "#EEF2FF", padding: "1px 4px", borderRadius: 3 }}>{part}</span> :
+                          <span key={i}>{part}</span>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {currentFull && (currentFull.marketContext || (currentFull.marketTags || []).length > 0) && (
+                  <div style={{ ...S.card, padding: 14 }}>
+                    <div style={S.h3}>市場狀態</div>
+                    {(currentFull.marketTags || []).length > 0 && (
+                      <div style={{ marginBottom: 8 }}>{currentFull.marketTags.map(t => <span key={t} style={S.tag("#FEF3C7", "#92400E")}>📌 {t}</span>)}</div>
+                    )}
+                    {currentFull.marketContext && <div style={{ fontSize: 13, lineHeight: 1.7, whiteSpace: "pre-wrap", color: "#475569" }}>{currentFull.marketContext}</div>}
+                  </div>
+                )}
               </div>
-              {/* Show inline images in search results */}
-              {full && full.images && full.images.length > 0 && (
-                <div style={{ marginTop: 8, display: "grid", gridTemplateColumns: full.images.length > 1 ? "1fr 1fr" : "1fr", gap: 6 }}>
-                  {full.images.map((img, i) => <img key={i} src={img} alt="" style={{ width: "100%", borderRadius: 6, maxHeight: 160, objectFit: "cover", border: "1px solid #E2E8F0" }} />)}
-                </div>
-              )}
-              {c.notes && <div style={{ marginTop: 6, fontSize: 12, color: "#64748B", lineHeight: 1.5, maxHeight: 36, overflow: "hidden" }}>{c.notes.slice(0, 120)}</div>}
-              {(c.tags || []).length > 0 && <div style={{ marginTop: 4 }}>{c.tags.slice(0, 5).map(t => <span key={t} style={S.tag("#F1F5F9", "#64748B")}>#{t}</span>)}</div>}
-            </div>
-          );
-        })}
-      </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
