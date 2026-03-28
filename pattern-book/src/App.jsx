@@ -420,9 +420,9 @@ function StockDatabook({ userId }) {
             [VIEWS.PATTERNS, "grid", "型態分類"],
             [VIEWS.CASES, "folder", "案例瀏覽"],
             [VIEWS.ADD, "plus", "新增案例"],
-            [VIEWS.JOURNAL, "journal", "📝 盤勢日誌"],
             [VIEWS.STATS, "chart", "統計分析"],
             [VIEWS.SEARCH, "search", "搜尋"],
+            [VIEWS.JOURNAL, "journal", "盤勢日誌"],
           ].map(([v, icon, label]) => (
             <div key={v} style={S.navItem(view === v || (v === VIEWS.JOURNAL && view === VIEWS.JOURNAL_EDIT))} onClick={() => { setView(v); if (v === VIEWS.CASES) { setSelectedPatternId(null); setSelectedCase(null); } }}>
               <Icon name={icon} size={16} /> {label}
@@ -443,7 +443,7 @@ function StockDatabook({ userId }) {
         {view === VIEWS.STATS && <StatsView patterns={patterns} casesIndex={casesIndex} topPatterns={topPatterns} getChildren={getChildren} allMktTags={allMktTags} />}
         {view === VIEWS.SEARCH && <SearchView casesIndex={casesIndex} caseStore={caseStore} loadCase={loadCaseOnDemand} getPattern={getPattern} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} allMktTags={allMktTags} setLightbox={setLightboxSrc} />}
         {view === VIEWS.JOURNAL && <JournalView journalsIndex={journalsIndex} journalStore={journalStore} loadJournal={loadJournalOnDemand} casesIndex={casesIndex} caseStore={caseStore} loadCase={loadCaseOnDemand} getPattern={getPattern} patterns={patterns} setLightbox={setLightboxSrc} onNew={(date) => { setEditingJournal({ date: date || new Date().toISOString().slice(0,10) }); setView(VIEWS.JOURNAL_EDIT); }} onEdit={(j) => { setEditingJournal(j); setView(VIEWS.JOURNAL_EDIT); }} onDelete={deleteJournalFn} openCase={(id) => { openCase(id); setView(VIEWS.CASES); }} />}
-        {view === VIEWS.JOURNAL_EDIT && <JournalForm existing={editingJournal?.content ? editingJournal : (editingJournal?.date && journalStore[editingJournal.date]) || null} defaultDate={editingJournal?.date} allMktTags={allMktTags} casesIndex={casesIndex} getPattern={getPattern} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} onSave={(j) => { saveJournalFn(j); showToast("✓ 日誌已儲存"); setView(VIEWS.JOURNAL); }} onCancel={() => setView(VIEWS.JOURNAL)} />}
+        {view === VIEWS.JOURNAL_EDIT && <JournalForm existing={editingJournal?.blocks ? editingJournal : (editingJournal?.date && journalStore[editingJournal.date]) || null} defaultDate={editingJournal?.date} allMktTags={allMktTags} casesIndex={casesIndex} getPattern={getPattern} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} onSave={(j) => { saveJournalFn(j); showToast("✓ 日誌已儲存"); setView(VIEWS.JOURNAL); }} onCancel={() => setView(VIEWS.JOURNAL)} />}
       </div>
 
       {patternModal && <PatternModal existing={patternModal.mode === "edit" ? patternModal.pattern : null} parentId={patternModal.parentId || null} patterns={patterns} topPatterns={topPatterns} onSave={savePatternFn} onClose={() => setPatternModal(null)} />}
@@ -1617,8 +1617,17 @@ function SearchView({ casesIndex, caseStore, loadCase, getPattern, patterns, top
 }
 
 /* ══════════════════════════════════════════════════════════════
-   JOURNAL VIEW — Calendar + Daily Entry
+   JOURNAL VIEW — Calendar + Daily Entry (Block-based)
    ══════════════════════════════════════════════════════════════ */
+function journalToBlocks(j) {
+  // backward compat: old format (content + images) → blocks
+  if (j.blocks) return j.blocks;
+  const blocks = [];
+  if (j.content) blocks.push({ type: "text", value: j.content });
+  if (j.images) j.images.forEach(img => blocks.push({ type: "image", value: img }));
+  return blocks.length > 0 ? blocks : [{ type: "text", value: "" }];
+}
+
 function JournalView({ journalsIndex, journalStore, loadJournal, casesIndex, caseStore, loadCase, getPattern, patterns, setLightbox, onNew, onEdit, onDelete, openCase }) {
   const today = new Date();
   const [calYear, setCalYear] = useState(today.getFullYear());
@@ -1627,7 +1636,6 @@ function JournalView({ journalsIndex, journalStore, loadJournal, casesIndex, cas
 
   const journalDates = useMemo(() => new Set(journalsIndex.map(j => j.date)), [journalsIndex]);
 
-  // Calendar helpers
   const daysInMonth = new Date(calYear, calMonth + 1, 0).getDate();
   const firstDay = new Date(calYear, calMonth, 1).getDay();
   const monthLabel = `${calYear} 年 ${calMonth + 1} 月`;
@@ -1645,7 +1653,6 @@ function JournalView({ journalsIndex, journalStore, loadJournal, casesIndex, cas
     return days;
   }, [calYear, calMonth, daysInMonth, firstDay, journalDates]);
 
-  // Load selected journal on demand
   useEffect(() => {
     if (selectedDate && journalDates.has(selectedDate) && !journalStore[selectedDate]) {
       loadJournal(selectedDate);
@@ -1655,13 +1662,34 @@ function JournalView({ journalsIndex, journalStore, loadJournal, casesIndex, cas
   const currentJournal = journalStore[selectedDate];
   const hasEntry = journalDates.has(selectedDate);
 
-  // Navigate days with arrows
   const sortedDates = useMemo(() => [...journalsIndex].sort((a, b) => a.date.localeCompare(b.date)).map(j => j.date), [journalsIndex]);
   const currentIdx = sortedDates.indexOf(selectedDate);
   const goPrevEntry = () => { if (currentIdx > 0) { const d = sortedDates[currentIdx - 1]; setSelectedDate(d); const dt = new Date(d); setCalYear(dt.getFullYear()); setCalMonth(dt.getMonth()); } };
   const goNextEntry = () => { if (currentIdx < sortedDates.length - 1) { const d = sortedDates[currentIdx + 1]; setSelectedDate(d); const dt = new Date(d); setCalYear(dt.getFullYear()); setCalMonth(dt.getMonth()); } };
 
-  // Render linked cases
+  const renderBlocks = (blocks) => {
+    if (!blocks || blocks.length === 0) return null;
+    return blocks.map((block, i) => {
+      if (block.type === "image") {
+        return (
+          <img key={i} src={block.value} alt="" style={{ width: "100%", borderRadius: 7, objectFit: "contain", border: "1px solid #E2E8F0", cursor: "pointer", marginBottom: 14, maxHeight: 500 }} onClick={() => setLightbox(block.value)} />
+        );
+      }
+      if (block.type === "text" && block.value.trim()) {
+        return (
+          <div key={i} style={{ fontSize: 13.5, lineHeight: 1.85, whiteSpace: "pre-wrap", color: "#334155", marginBottom: 14 }}>
+            {block.value.split(/(#[\w\u4e00-\u9fff\u3400-\u4dbf]+)/g).map((part, j) =>
+              part.match(/^#[\w\u4e00-\u9fff\u3400-\u4dbf]+$/) ?
+                <span key={j} style={{ color: "#4F46E5", fontWeight: 600, background: "#EEF2FF", padding: "1px 4px", borderRadius: 3 }}>{part}</span> :
+                <span key={j}>{part}</span>
+            )}
+          </div>
+        );
+      }
+      return null;
+    });
+  };
+
   const renderLinkedCases = (linkedIds) => {
     if (!linkedIds || linkedIds.length === 0) return null;
     return (
@@ -1694,7 +1722,7 @@ function JournalView({ journalsIndex, journalStore, loadJournal, casesIndex, cas
   return (
     <div>
       <div style={S.flexBetween}>
-        <div><div style={S.h1}>📝 盤勢日誌</div><div style={S.sub}>每日市場觀察記錄</div></div>
+        <div><div style={S.h1}>盤勢日誌</div><div style={S.sub}>每日市場觀察記錄</div></div>
         <button style={S.btn()} onClick={() => onNew(selectedDate)}>+ 新增日誌</button>
       </div>
 
@@ -1733,13 +1761,11 @@ function JournalView({ journalsIndex, journalStore, loadJournal, casesIndex, cas
                 );
               })}
             </div>
-            {/* Quick jump to today */}
             <div style={{ marginTop: 10, textAlign: "center" }}>
               <button style={{ ...S.btnOutline, padding: "4px 12px", fontSize: 11 }} onClick={() => { setCalYear(today.getFullYear()); setCalMonth(today.getMonth()); setSelectedDate(today.toISOString().slice(0, 10)); }}>今天</button>
             </div>
           </div>
 
-          {/* Recent journals list */}
           <div style={{ ...S.card, marginTop: 10 }}>
             <div style={S.h3}>最近日誌</div>
             <div style={{ display: "flex", flexDirection: "column", gap: 4, maxHeight: 200, overflowY: "auto" }}>
@@ -1788,29 +1814,10 @@ function JournalView({ journalsIndex, journalStore, loadJournal, casesIndex, cas
                 )}
               </div>
 
-              {/* Images */}
-              {currentJournal.images && currentJournal.images.length > 0 && (
-                <div style={{ ...S.card, padding: 14 }}>
-                  <div style={S.h3}>截圖 ({currentJournal.images.length})</div>
-                  {currentJournal.images.map((img, i) => (
-                    <img key={i} src={img} alt="" style={{ width: "100%", borderRadius: 7, objectFit: "contain", border: "1px solid #E2E8F0", cursor: "pointer", marginBottom: i < currentJournal.images.length - 1 ? 10 : 0, maxHeight: 400 }} onClick={() => setLightbox(img)} />
-                  ))}
-                </div>
-              )}
-
-              {/* Content */}
-              {currentJournal.content && (
-                <div style={{ ...S.card, padding: 14 }}>
-                  <div style={S.h3}>內容</div>
-                  <div style={{ fontSize: 13, lineHeight: 1.8, whiteSpace: "pre-wrap", color: "#334155" }}>
-                    {currentJournal.content.split(/(#[\w\u4e00-\u9fff\u3400-\u4dbf]+)/g).map((part, i) =>
-                      part.match(/^#[\w\u4e00-\u9fff\u3400-\u4dbf]+$/) ?
-                        <span key={i} style={{ color: "#4F46E5", fontWeight: 600, background: "#EEF2FF", padding: "1px 4px", borderRadius: 3 }}>{part}</span> :
-                        <span key={i}>{part}</span>
-                    )}
-                  </div>
-                </div>
-              )}
+              {/* Blog-style blocks: text and images interleaved */}
+              <div style={{ ...S.card, padding: 18 }}>
+                {renderBlocks(journalToBlocks(currentJournal))}
+              </div>
 
               {/* Linked cases */}
               {renderLinkedCases(currentJournal.linkedCases)}
@@ -1829,7 +1836,7 @@ function JournalView({ journalsIndex, journalStore, loadJournal, casesIndex, cas
 
           {!hasEntry && (
             <div style={{ ...S.card, textAlign: "center", padding: 44, color: "#94A3B8" }}>
-              <div style={{ fontSize: 32, marginBottom: 10 }}>📝</div>
+              <div style={{ fontSize: 32, marginBottom: 10 }}>📋</div>
               <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 8 }}>{selectedDate} 尚無日誌</div>
               <button style={S.btn()} onClick={() => onNew(selectedDate)}>撰寫今日日誌</button>
             </div>
@@ -1841,43 +1848,97 @@ function JournalView({ journalsIndex, journalStore, loadJournal, casesIndex, cas
 }
 
 /* ══════════════════════════════════════════════════════════════
-   JOURNAL FORM
+   JOURNAL FORM — Block-based Editor (text ↔ image interleaved)
    ══════════════════════════════════════════════════════════════ */
 function JournalForm({ existing, defaultDate, allMktTags, casesIndex, getPattern, patterns, topPatterns, getChildren, onSave, onCancel }) {
-  const isEdit = !!(existing && existing.content);
+  const isEdit = !!(existing && existing.blocks);
+
+  // Initialize blocks from existing or start with one empty text block
+  const initBlocks = () => {
+    if (existing?.blocks) return existing.blocks;
+    if (existing?.content) {
+      const b = [{ type: "text", value: existing.content }];
+      if (existing.images) existing.images.forEach(img => b.push({ type: "image", value: img }));
+      return b;
+    }
+    return [{ type: "text", value: "" }];
+  };
+
   const [form, setForm] = useState({
     date: existing?.date || defaultDate || new Date().toISOString().slice(0, 10),
     title: existing?.title || "",
-    content: existing?.content || "",
     marketTags: existing?.marketTags || [],
-    images: existing?.images || [],
     linkedCases: existing?.linkedCases || [],
-    tags: existing?.tags || [],
   });
+  const [blocks, setBlocks] = useState(initBlocks);
   const [mktTagInput, setMktTagInput] = useState("");
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [caseSearchQ, setCaseSearchQ] = useState("");
-  const [compressing, setCompressing] = useState(false);
   const [formError, setFormError] = useState(null);
-  const fileRef = useRef();
+  const fileRefs = useRef({});
   const sugRef = useRef();
 
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
 
-  const handleImages = async (e) => {
-    const files = Array.from(e.target.files).slice(0, 10 - form.images.length);
-    if (files.length === 0) return;
-    setCompressing(true);
-    try {
-      const results = await Promise.all(files.map(f => compressImage(f, 1600, 0.9)));
-      setForm(f => ({ ...f, images: [...f.images, ...results].slice(0, 10) }));
-    } catch (err) { console.error("compress err", err); }
-    setCompressing(false);
-    e.target.value = "";
+  const updateBlock = (idx, value) => {
+    setBlocks(prev => prev.map((b, i) => i === idx ? { ...b, value } : b));
   };
 
-  const removeImage = (idx) => setForm(f => ({ ...f, images: f.images.filter((_, i) => i !== idx) }));
+  const removeBlock = (idx) => {
+    setBlocks(prev => {
+      const next = prev.filter((_, i) => i !== idx);
+      return next.length === 0 ? [{ type: "text", value: "" }] : next;
+    });
+  };
 
+  const insertImageAt = (afterIdx) => {
+    const id = "fref-" + afterIdx;
+    if (!fileRefs.current[id]) {
+      const input = document.createElement("input");
+      input.type = "file";
+      input.accept = "image/*";
+      input.multiple = true;
+      input.onchange = (e) => {
+        const files = Array.from(e.target.files).slice(0, 10);
+        files.forEach(file => {
+          const reader = new FileReader();
+          reader.onload = (ev) => {
+            setBlocks(prev => {
+              const newBlocks = [...prev];
+              // insert after afterIdx
+              newBlocks.splice(afterIdx + 1, 0, { type: "image", value: ev.target.result });
+              afterIdx++; // shift for multiple files
+              return newBlocks;
+            });
+          };
+          reader.readAsDataURL(file);
+        });
+        input.value = "";
+      };
+      fileRefs.current[id] = input;
+    }
+    fileRefs.current[id].click();
+  };
+
+  const insertTextAt = (afterIdx) => {
+    setBlocks(prev => {
+      const newBlocks = [...prev];
+      newBlocks.splice(afterIdx + 1, 0, { type: "text", value: "" });
+      return newBlocks;
+    });
+  };
+
+  const moveBlock = (idx, dir) => {
+    setBlocks(prev => {
+      const next = [...prev];
+      const target = idx + dir;
+      if (target < 0 || target >= next.length) return next;
+      [next[idx], next[target]] = [next[target], next[idx]];
+      return next;
+    });
+  };
+
+  // Market tag helpers
   const addMarketTag = (t) => {
     const tag = (t || mktTagInput).trim();
     if (tag && !form.marketTags.includes(tag)) set("marketTags", [...form.marketTags, tag]);
@@ -1891,7 +1952,6 @@ function JournalForm({ existing, defaultDate, allMktTags, casesIndex, getPattern
     return allMktTags.filter(t => t.toLowerCase().includes(lower) && !form.marketTags.includes(t));
   }, [mktTagInput, allMktTags, form.marketTags]);
 
-  // Case linking search
   const caseResults = useMemo(() => {
     if (!caseSearchQ.trim()) return [];
     const lower = caseSearchQ.toLowerCase();
@@ -1907,24 +1967,38 @@ function JournalForm({ existing, defaultDate, allMktTags, casesIndex, getPattern
     return () => document.removeEventListener("mousedown", handler);
   }, []);
 
+  // Extract all tags from all text blocks
+  const allTextContent = blocks.filter(b => b.type === "text").map(b => b.value).join("\n");
+  const allExtractedTags = extractTags(allTextContent);
+  const imageCount = blocks.filter(b => b.type === "image").length;
+
   const handleSubmit = () => {
     if (!form.date) { setFormError("請選擇日期"); return; }
     setFormError(null);
-    const tags = extractTags(form.content);
-    onSave({ ...form, tags });
+    // Clean empty trailing text blocks but keep at least structure
+    const cleanBlocks = blocks.filter((b, i) => {
+      if (b.type === "image") return true;
+      if (b.value.trim()) return true;
+      // keep if it's the only block
+      return blocks.length === 1;
+    });
+    onSave({ ...form, blocks: cleanBlocks.length > 0 ? cleanBlocks : blocks, tags: allExtractedTags });
   };
+
+  // Block toolbar button style
+  const tbBtn = { background: "none", border: "1px solid #E2E8F0", borderRadius: 5, padding: "2px 7px", cursor: "pointer", fontSize: 11, color: "#64748B", fontFamily: font };
 
   return (
     <div>
       <div style={S.h1}>{isEdit ? "編輯日誌" : "新增盤勢日誌"}</div>
       <div style={S.sub}>{form.date} · {new Date(form.date).toLocaleDateString("zh-TW", { weekday: "long" })}</div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "1.2fr 1fr", gap: 20 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 320px", gap: 20 }}>
+        {/* Left: Main editor */}
         <div>
           {/* Basic info */}
           <div style={S.card}>
-            <div style={S.h3}>基本資訊</div>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "160px 1fr", gap: 12 }}>
               <div>
                 <label style={S.label}>日期 *</label>
                 <input type="date" style={S.input} value={form.date} onChange={e => set("date", e.target.value)} />
@@ -1936,20 +2010,65 @@ function JournalForm({ existing, defaultDate, allMktTags, casesIndex, getPattern
             </div>
           </div>
 
-          {/* Content */}
+          {/* Block editor */}
           <div style={S.card}>
-            <div style={S.h3}>日誌內容</div>
-            <div style={{ fontSize: 11, color: "#94A3B8", marginBottom: 6 }}>使用 #標籤 自動解析</div>
-            <textarea style={{ ...S.textarea, minHeight: 160 }} value={form.content} onChange={e => set("content", e.target.value)} placeholder={"今日盤勢觀察...\n#大盤多頭 #量能萎縮 #外資買超"} />
-            {extractTags(form.content).length > 0 && (
-              <div style={{ marginTop: 6 }}>
+            <div style={{ ...S.flexBetween, marginBottom: 10 }}>
+              <div style={S.h3}>日誌內容</div>
+              <div style={{ fontSize: 11, color: "#94A3B8" }}>📷 {imageCount} 張圖 · #標籤自動解析</div>
+            </div>
+
+            {blocks.map((block, idx) => (
+              <div key={idx} style={{ marginBottom: 8 }}>
+                {block.type === "text" ? (
+                  <div>
+                    <textarea
+                      style={{ ...S.textarea, minHeight: 80, borderColor: "#E2E8F0" }}
+                      value={block.value}
+                      onChange={e => updateBlock(idx, e.target.value)}
+                      placeholder={idx === 0 ? "開始撰寫今日盤勢觀察...\n使用 #標籤 自動解析" : "繼續撰寫..."}
+                    />
+                  </div>
+                ) : (
+                  <div style={{ position: "relative", border: "1px solid #E2E8F0", borderRadius: 7, overflow: "hidden" }}>
+                    <img src={block.value} alt="" style={{ width: "100%", display: "block", objectFit: "contain", maxHeight: 400 }} />
+                  </div>
+                )}
+                {/* Block toolbar */}
+                <div style={{ display: "flex", gap: 4, marginTop: 4, justifyContent: "flex-end", alignItems: "center" }}>
+                  {idx > 0 && <button style={tbBtn} onClick={() => moveBlock(idx, -1)} title="上移">↑</button>}
+                  {idx < blocks.length - 1 && <button style={tbBtn} onClick={() => moveBlock(idx, 1)} title="下移">↓</button>}
+                  <button style={tbBtn} onClick={() => insertImageAt(idx)} title="在下方插入圖片">📷 插圖</button>
+                  <button style={tbBtn} onClick={() => insertTextAt(idx)} title="在下方插入文字段落">📝 插文字</button>
+                  {blocks.length > 1 && (
+                    <button style={{ ...tbBtn, color: "#EF4444", borderColor: "#FECACA" }} onClick={() => removeBlock(idx)} title="刪除此區塊">✕</button>
+                  )}
+                </div>
+              </div>
+            ))}
+
+            {/* Bottom insert bar */}
+            <div style={{ display: "flex", gap: 8, marginTop: 12, justifyContent: "center" }}>
+              <button style={{ ...S.btnOutline, padding: "6px 14px", fontSize: 12 }} onClick={() => setBlocks(prev => [...prev, { type: "text", value: "" }])}>+ 文字段落</button>
+              <button style={{ ...S.btnOutline, padding: "6px 14px", fontSize: 12 }} onClick={() => insertImageAt(blocks.length - 1)}>+ 圖片</button>
+            </div>
+
+            {allExtractedTags.length > 0 && (
+              <div style={{ marginTop: 12, paddingTop: 10, borderTop: "1px solid #F1F5F9" }}>
                 <span style={{ fontSize: 11, color: "#94A3B8", marginRight: 4 }}>標籤：</span>
-                {extractTags(form.content).map(t => <span key={t} style={S.tag()}>#{t}</span>)}
+                {allExtractedTags.map(t => <span key={t} style={S.tag()}>#{t}</span>)}
               </div>
             )}
           </div>
 
-          {/* Market tags */}
+          <div style={{ ...S.flexGap(8), justifyContent: "flex-end", marginTop: 14 }}>
+            {formError && <div style={{ color: "#DC2626", fontSize: 13, fontWeight: 600, marginRight: "auto" }}>⚠ {formError}</div>}
+            <button style={S.btnOutline} onClick={onCancel}>取消</button>
+            <button style={S.btn()} onClick={handleSubmit}>{isEdit ? "更新日誌" : "儲存日誌"}</button>
+          </div>
+        </div>
+
+        {/* Right: Market tags + Link cases */}
+        <div>
           <div style={S.card}>
             <div style={S.h3}>市場標籤</div>
             <div ref={sugRef}>
@@ -1958,7 +2077,7 @@ function JournalForm({ existing, defaultDate, allMktTags, casesIndex, getPattern
                   <input style={{ ...S.input, flex: 1 }} value={mktTagInput}
                     onChange={e => { setMktTagInput(e.target.value); setShowSuggestions(true); }}
                     onFocus={() => setShowSuggestions(true)}
-                    placeholder="輸入或選擇已有標籤..."
+                    placeholder="輸入或選擇標籤..."
                     onKeyDown={e => { if (e.key === "Enter") { e.preventDefault(); addMarketTag(); } }} />
                   <button style={S.btn()} onClick={() => addMarketTag()}>加入</button>
                 </div>
@@ -1992,10 +2111,9 @@ function JournalForm({ existing, defaultDate, allMktTags, casesIndex, getPattern
             </div>
           </div>
 
-          {/* Link cases */}
           <div style={S.card}>
             <div style={S.h3}>🔗 連結案例</div>
-            <input style={{ ...S.input, marginBottom: 8 }} value={caseSearchQ} onChange={e => setCaseSearchQ(e.target.value)} placeholder="搜尋股票代碼以連結案例..." />
+            <input style={{ ...S.input, marginBottom: 8 }} value={caseSearchQ} onChange={e => setCaseSearchQ(e.target.value)} placeholder="搜尋股票代碼..." />
             {caseResults.length > 0 && (
               <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 8 }}>
                 {caseResults.map(c => {
@@ -2006,7 +2124,6 @@ function JournalForm({ existing, defaultDate, allMktTags, casesIndex, getPattern
                       <div style={S.flexGap(6)}>
                         {p && <Dot color={p.color} size={7} />}
                         <span style={{ fontWeight: 600, fontSize: 12 }}>{c.ticker}</span>
-                        {p && <span style={{ fontSize: 10, color: "#94A3B8" }}>{getPatternLabel(p, patterns)}</span>}
                       </div>
                       <span style={{ fontSize: 11, color: "#4F46E5" }}>+ 連結</span>
                     </div>
@@ -2025,7 +2142,6 @@ function JournalForm({ existing, defaultDate, allMktTags, casesIndex, getPattern
                       <div style={S.flexGap(6)}>
                         {p && <Dot color={p.color} size={7} />}
                         <span style={{ fontWeight: 600, fontSize: 12 }}>{c.ticker}</span>
-                        {p && <span style={{ fontSize: 10, color: p.color }}>{getPatternLabel(p, patterns)}</span>}
                         <span style={S.badge(c.result)}>{c.result === "success" ? "成功" : c.result === "failure" ? "失敗" : "觀察"}</span>
                       </div>
                       <button style={{ ...S.btnOutline, padding: "2px 8px", fontSize: 11, color: "#EF4444", borderColor: "#FECACA" }}
@@ -2035,37 +2151,6 @@ function JournalForm({ existing, defaultDate, allMktTags, casesIndex, getPattern
                 })}
               </div>
             )}
-          </div>
-        </div>
-
-        <div>
-          {/* Images */}
-          <div style={S.card}>
-            <div style={S.h3}>截圖（最多 10 張，自動壓縮）</div>
-            <div style={{ fontSize: 11, color: "#94A3B8", marginBottom: 8 }}>已上傳 {form.images.length} / 10 張</div>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-              {form.images.map((img, i) => (
-                <div key={i} style={{ position: "relative" }}>
-                  <img src={img} alt="" style={{ width: "100%", borderRadius: 7, objectFit: "cover", border: "1px solid #E2E8F0", maxHeight: 160 }} />
-                  <button onClick={() => removeImage(i)} style={{ position: "absolute", top: 4, right: 4, background: "rgba(0,0,0,0.5)", color: "#FFF", border: "none", borderRadius: "50%", width: 22, height: 22, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11 }}>✕</button>
-                </div>
-              ))}
-            </div>
-            {form.images.length < 10 && (
-              <div onClick={() => !compressing && fileRef.current?.click()} style={{ border: "2px dashed #D1D5DB", borderRadius: 8, padding: 24, textAlign: "center", cursor: compressing ? "wait" : "pointer", color: "#94A3B8", transition: "border-color .15s", marginTop: form.images.length > 0 ? 8 : 0 }}
-                onMouseEnter={e => e.currentTarget.style.borderColor = "#4F46E5"}
-                onMouseLeave={e => e.currentTarget.style.borderColor = "#D1D5DB"}>
-                <Icon name="img" size={24} />
-                <div style={{ marginTop: 4, fontSize: 12, fontWeight: 500 }}>{compressing ? "壓縮中..." : "點擊上傳圖片"}</div>
-                <input ref={fileRef} type="file" accept="image/*" multiple style={{ display: "none" }} onChange={handleImages} />
-              </div>
-            )}
-          </div>
-
-          <div style={{ ...S.flexGap(8), justifyContent: "flex-end", marginTop: 14, flexWrap: "wrap" }}>
-            {formError && <div style={{ width: "100%", textAlign: "right", color: "#DC2626", fontSize: 13, fontWeight: 600, marginBottom: 4 }}>⚠ {formError}</div>}
-            <button style={S.btnOutline} onClick={onCancel}>取消</button>
-            <button style={S.btn()} onClick={handleSubmit}>{isEdit ? "更新日誌" : "儲存日誌"}</button>
           </div>
         </div>
       </div>
