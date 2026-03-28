@@ -12,7 +12,7 @@ const fmt = (d) => d ? new Date(d).toLocaleDateString("zh-TW", { year: "numeric"
 const pct = (n, d) => d === 0 ? "—" : Math.round((n / d) * 100) + "%";
 
 const COLORS = ["#7C8CF8","#60A5FA","#34D399","#FBBF24","#F87171","#A78BFA","#F472B6","#38BDF8","#4ADE80","#FB923C"];
-const VIEWS = { DASH:"dash", PATTERNS:"patterns", CASES:"cases", ADD:"add", EDIT:"edit", STATS:"stats", SEARCH:"search" };
+const VIEWS = { DASH:"dash", PATTERNS:"patterns", CASES:"cases", ADD:"add", EDIT:"edit", STATS:"stats", SEARCH:"search", JOURNAL:"journal", JOURNAL_EDIT:"journal_edit" };
 
 /* ── Firestore Storage Helpers ── */
 async function fsLoadPatterns(uid) {
@@ -38,6 +38,46 @@ async function fsDeleteCase(uid, id) {
 }
 async function fsLoadAllCases(uid) {
   try { const snap = await getDocs(collection(db, "users", uid, "cases")); const store = {}; snap.forEach(d => { store[d.id] = d.data(); }); return store; } catch(e) { console.error("load all cases err", e); return {}; }
+}
+
+/* ── Journal Firestore Helpers ── */
+async function fsLoadJournalsIndex(uid) {
+  try { const snap = await getDoc(doc(db, "users", uid, "data", "journalsIndex")); return snap.exists() ? snap.data().items || [] : []; } catch(e) { console.error("load journals index err", e); return []; }
+}
+async function fsSaveJournalsIndex(uid, idx) {
+  try { await setDoc(doc(db, "users", uid, "data", "journalsIndex"), { items: idx }); } catch(e) { console.error("save journals index err", e); }
+}
+async function fsSaveJournal(uid, j) {
+  try { await setDoc(doc(db, "users", uid, "journals", j.date), j); } catch(e) { console.error("save journal err", e); }
+}
+async function fsLoadJournal(uid, date) {
+  try { const snap = await getDoc(doc(db, "users", uid, "journals", date)); return snap.exists() ? snap.data() : null; } catch(e) { console.error("load journal err", e); return null; }
+}
+async function fsDeleteJournal(uid, date) {
+  try { await deleteDoc(doc(db, "users", uid, "journals", date)); } catch(e) { console.error("delete journal err", e); }
+}
+
+/* ── Image Compression ── */
+function compressImage(file, maxWidth = 1600, quality = 0.9) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        let w = img.width, h = img.height;
+        if (w > maxWidth) { h = Math.round(h * maxWidth / w); w = maxWidth; }
+        const canvas = document.createElement("canvas");
+        canvas.width = w; canvas.height = h;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0, w, h);
+        resolve(canvas.toDataURL("image/jpeg", quality));
+      };
+      img.onerror = reject;
+      img.src = e.target.result;
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
 }
 
 /* ── Styles ── */
@@ -102,6 +142,9 @@ const Icon = ({ name, size = 17 }) => {
     img: <><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></>,
     back: <path d="M19 12H5M12 19l-7-7 7-7"/>,
     subitem: <path d="M9 3v12a3 3 0 003 3h9"/>,
+    journal: <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/>,
+    link: <path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71"/>,
+    calendar: <><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></>,
   };
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none"
@@ -159,6 +202,9 @@ function StockDatabook({ userId }) {
   const [lightboxSrc, setLightboxSrc] = useState(null);
   const [patternModal, setPatternModal] = useState(null);
   const [toastMsg, setToastMsg] = useState(null);
+  const [journalsIndex, setJournalsIndex] = useState([]);
+  const [journalStore, setJournalStore] = useState({});
+  const [editingJournal, setEditingJournal] = useState(null);
 
   const showToast = (msg) => {
     setToastMsg(msg);
@@ -168,8 +214,9 @@ function StockDatabook({ userId }) {
   const allMktTags = useMemo(() => {
     const set = new Set();
     casesIndex.forEach(c => (c.marketTags || []).forEach(t => set.add(t)));
+    journalsIndex.forEach(j => (j.marketTags || []).forEach(t => set.add(t)));
     return [...set].sort();
-  }, [casesIndex]);
+  }, [casesIndex, journalsIndex]);
 
   useEffect(() => {
     let done = false;
@@ -177,7 +224,8 @@ function StockDatabook({ userId }) {
       try {
         const p = await fsLoadPatterns(userId);
         const ci = await fsLoadCasesIndex(userId);
-        if (!done) { setPatterns(p); setCasesIndex(ci); }
+        const ji = await fsLoadJournalsIndex(userId);
+        if (!done) { setPatterns(p); setCasesIndex(ci); setJournalsIndex(ji); }
         // No longer loading all cases upfront - they load on demand
       } catch (e) { console.error("Load error:", e); }
       done = true;
@@ -318,6 +366,40 @@ function StockDatabook({ userId }) {
     });
   }, [caseStore, userId]);
 
+  /* ── Journal CRUD ── */
+  const saveJournalFn = (j) => {
+    const indexEntry = { date: j.date, title: j.title, marketTags: j.marketTags || [], tags: j.tags || [], linkedCases: j.linkedCases || [] };
+    let nextIdx;
+    if (journalsIndex.find(x => x.date === j.date)) {
+      nextIdx = journalsIndex.map(x => x.date === j.date ? indexEntry : x);
+    } else {
+      nextIdx = [...journalsIndex, indexEntry].sort((a, b) => b.date.localeCompare(a.date));
+    }
+    setJournalsIndex(nextIdx);
+    setJournalStore(prev => ({ ...prev, [j.date]: j }));
+    fsSaveJournalsIndex(userId, nextIdx);
+    fsSaveJournal(userId, j);
+  };
+
+  const deleteJournalFn = (date) => {
+    if (!confirm("確定刪除此日誌？")) return;
+    const nextIdx = journalsIndex.filter(x => x.date !== date);
+    setJournalsIndex(nextIdx);
+    setJournalStore(prev => { const n = { ...prev }; delete n[date]; return n; });
+    fsSaveJournalsIndex(userId, nextIdx);
+    fsDeleteJournal(userId, date);
+    showToast("已刪除日誌");
+  };
+
+  const loadJournalOnDemand = useCallback((date) => {
+    if (journalStore[date]) return;
+    fsLoadJournal(userId, date).then(loaded => {
+      if (loaded) {
+        setJournalStore(prev => ({ ...prev, [date]: loaded }));
+      }
+    });
+  }, [journalStore, userId]);
+
   const getPattern = (id) => patterns.find(p => p.id === id);
   const topPatterns = useMemo(() => patterns.filter(p => !p.parentId), [patterns]);
   const getChildren = useCallback((pid) => patterns.filter(p => p.parentId === pid), [patterns]);
@@ -338,16 +420,17 @@ function StockDatabook({ userId }) {
             [VIEWS.PATTERNS, "grid", "型態分類"],
             [VIEWS.CASES, "folder", "案例瀏覽"],
             [VIEWS.ADD, "plus", "新增案例"],
+            [VIEWS.JOURNAL, "journal", "📝 盤勢日誌"],
             [VIEWS.STATS, "chart", "統計分析"],
             [VIEWS.SEARCH, "search", "搜尋"],
           ].map(([v, icon, label]) => (
-            <div key={v} style={S.navItem(view === v)} onClick={() => { setView(v); if (v === VIEWS.CASES) { setSelectedPatternId(null); setSelectedCase(null); } }}>
+            <div key={v} style={S.navItem(view === v || (v === VIEWS.JOURNAL && view === VIEWS.JOURNAL_EDIT))} onClick={() => { setView(v); if (v === VIEWS.CASES) { setSelectedPatternId(null); setSelectedCase(null); } }}>
               <Icon name={icon} size={16} /> {label}
             </div>
           ))}
         </nav>
         <div style={{ padding: "0 18px", fontSize: 11, color: "#CBD5E1" }}>
-          {casesIndex.length} 筆案例 · {patterns.length} 個型態
+          {casesIndex.length} 筆案例 · {patterns.length} 個型態 · {journalsIndex.length} 篇日誌
         </div>
       </div>
 
@@ -359,6 +442,8 @@ function StockDatabook({ userId }) {
         {view === VIEWS.EDIT && editingCase && <CaseForm patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} allMktTags={allMktTags} existing={editingCase} onSave={(c) => { saveCaseFn(c); setSelectedCase(c); showToast("✓ 更新成功"); setView(VIEWS.CASES); }} onCancel={() => setView(VIEWS.CASES)} />}
         {view === VIEWS.STATS && <StatsView patterns={patterns} casesIndex={casesIndex} topPatterns={topPatterns} getChildren={getChildren} allMktTags={allMktTags} />}
         {view === VIEWS.SEARCH && <SearchView casesIndex={casesIndex} caseStore={caseStore} loadCase={loadCaseOnDemand} getPattern={getPattern} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} allMktTags={allMktTags} setLightbox={setLightboxSrc} />}
+        {view === VIEWS.JOURNAL && <JournalView journalsIndex={journalsIndex} journalStore={journalStore} loadJournal={loadJournalOnDemand} casesIndex={casesIndex} caseStore={caseStore} loadCase={loadCaseOnDemand} getPattern={getPattern} patterns={patterns} setLightbox={setLightboxSrc} onNew={(date) => { setEditingJournal({ date: date || new Date().toISOString().slice(0,10) }); setView(VIEWS.JOURNAL_EDIT); }} onEdit={(j) => { setEditingJournal(j); setView(VIEWS.JOURNAL_EDIT); }} onDelete={deleteJournalFn} openCase={(id) => { openCase(id); setView(VIEWS.CASES); }} />}
+        {view === VIEWS.JOURNAL_EDIT && <JournalForm existing={editingJournal?.content ? editingJournal : (editingJournal?.date && journalStore[editingJournal.date]) || null} defaultDate={editingJournal?.date} allMktTags={allMktTags} casesIndex={casesIndex} getPattern={getPattern} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} onSave={(j) => { saveJournalFn(j); showToast("✓ 日誌已儲存"); setView(VIEWS.JOURNAL); }} onCancel={() => setView(VIEWS.JOURNAL)} />}
       </div>
 
       {patternModal && <PatternModal existing={patternModal.mode === "edit" ? patternModal.pattern : null} parentId={patternModal.parentId || null} patterns={patterns} topPatterns={topPatterns} onSave={savePatternFn} onClose={() => setPatternModal(null)} />}
@@ -1527,6 +1612,463 @@ function SearchView({ casesIndex, caseStore, loadCase, getPattern, patterns, top
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════
+   JOURNAL VIEW — Calendar + Daily Entry
+   ══════════════════════════════════════════════════════════════ */
+function JournalView({ journalsIndex, journalStore, loadJournal, casesIndex, caseStore, loadCase, getPattern, patterns, setLightbox, onNew, onEdit, onDelete, openCase }) {
+  const today = new Date();
+  const [calYear, setCalYear] = useState(today.getFullYear());
+  const [calMonth, setCalMonth] = useState(today.getMonth());
+  const [selectedDate, setSelectedDate] = useState(today.toISOString().slice(0, 10));
+
+  const journalDates = useMemo(() => new Set(journalsIndex.map(j => j.date)), [journalsIndex]);
+
+  // Calendar helpers
+  const daysInMonth = new Date(calYear, calMonth + 1, 0).getDate();
+  const firstDay = new Date(calYear, calMonth, 1).getDay();
+  const monthLabel = `${calYear} 年 ${calMonth + 1} 月`;
+
+  const prevMonth = () => { if (calMonth === 0) { setCalYear(y => y - 1); setCalMonth(11); } else setCalMonth(m => m - 1); };
+  const nextMonth = () => { if (calMonth === 11) { setCalYear(y => y + 1); setCalMonth(0); } else setCalMonth(m => m + 1); };
+
+  const calendarDays = useMemo(() => {
+    const days = [];
+    for (let i = 0; i < firstDay; i++) days.push(null);
+    for (let d = 1; d <= daysInMonth; d++) {
+      const dateStr = `${calYear}-${String(calMonth + 1).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+      days.push({ day: d, date: dateStr, hasEntry: journalDates.has(dateStr) });
+    }
+    return days;
+  }, [calYear, calMonth, daysInMonth, firstDay, journalDates]);
+
+  // Load selected journal on demand
+  useEffect(() => {
+    if (selectedDate && journalDates.has(selectedDate) && !journalStore[selectedDate]) {
+      loadJournal(selectedDate);
+    }
+  }, [selectedDate, journalDates]);
+
+  const currentJournal = journalStore[selectedDate];
+  const hasEntry = journalDates.has(selectedDate);
+
+  // Navigate days with arrows
+  const sortedDates = useMemo(() => [...journalsIndex].sort((a, b) => a.date.localeCompare(b.date)).map(j => j.date), [journalsIndex]);
+  const currentIdx = sortedDates.indexOf(selectedDate);
+  const goPrevEntry = () => { if (currentIdx > 0) { const d = sortedDates[currentIdx - 1]; setSelectedDate(d); const dt = new Date(d); setCalYear(dt.getFullYear()); setCalMonth(dt.getMonth()); } };
+  const goNextEntry = () => { if (currentIdx < sortedDates.length - 1) { const d = sortedDates[currentIdx + 1]; setSelectedDate(d); const dt = new Date(d); setCalYear(dt.getFullYear()); setCalMonth(dt.getMonth()); } };
+
+  // Render linked cases
+  const renderLinkedCases = (linkedIds) => {
+    if (!linkedIds || linkedIds.length === 0) return null;
+    return (
+      <div style={{ ...S.card, padding: 14 }}>
+        <div style={S.h3}>🔗 連結案例</div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          {linkedIds.map(id => {
+            const c = casesIndex.find(x => x.id === id);
+            if (!c) return null;
+            const p = getPattern(c.patternId);
+            return (
+              <div key={id} style={{ ...S.flexBetween, padding: "7px 10px", borderRadius: 7, background: "#F8FAFC", cursor: "pointer" }} onClick={() => openCase(id)}>
+                <div style={S.flexGap(8)}>
+                  {p && <Dot color={p.color} size={8} />}
+                  <span style={{ fontWeight: 600, fontSize: 12.5 }}>{c.ticker}</span>
+                  {p && <span style={S.tag()}>{getPatternLabel(p, patterns)}</span>}
+                </div>
+                <div style={S.flexGap(6)}>
+                  <span style={S.badge(c.result)}>{c.result === "success" ? "成功" : c.result === "failure" ? "失敗" : "觀察"}</span>
+                  <span style={{ fontSize: 11, color: "#CBD5E1" }}>{fmt(c.patternDate)}</span>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div>
+      <div style={S.flexBetween}>
+        <div><div style={S.h1}>📝 盤勢日誌</div><div style={S.sub}>每日市場觀察記錄</div></div>
+        <button style={S.btn()} onClick={() => onNew(selectedDate)}>+ 新增日誌</button>
+      </div>
+
+      <div style={{ display: "flex", gap: 18, alignItems: "flex-start" }}>
+        {/* Left: Calendar */}
+        <div style={{ width: 280, minWidth: 280 }}>
+          <div style={S.card}>
+            <div style={{ ...S.flexBetween, marginBottom: 12 }}>
+              <button style={{ ...S.btnOutline, padding: "4px 10px", fontSize: 14, fontWeight: 700 }} onClick={prevMonth}>←</button>
+              <span style={{ fontWeight: 600, fontSize: 14, color: "#334155" }}>{monthLabel}</span>
+              <button style={{ ...S.btnOutline, padding: "4px 10px", fontSize: 14, fontWeight: 700 }} onClick={nextMonth}>→</button>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 2, textAlign: "center" }}>
+              {["日", "一", "二", "三", "四", "五", "六"].map(d => (
+                <div key={d} style={{ fontSize: 11, fontWeight: 600, color: "#94A3B8", padding: "4px 0" }}>{d}</div>
+              ))}
+              {calendarDays.map((item, i) => {
+                if (!item) return <div key={`empty-${i}`} />;
+                const isSelected = item.date === selectedDate;
+                const isToday = item.date === today.toISOString().slice(0, 10);
+                return (
+                  <div key={item.date} onClick={() => setSelectedDate(item.date)}
+                    style={{
+                      padding: "6px 2px", borderRadius: 6, cursor: "pointer", fontSize: 12.5, fontWeight: isSelected ? 700 : 400,
+                      background: isSelected ? "#4F46E5" : isToday ? "#EEF2FF" : "transparent",
+                      color: isSelected ? "#FFF" : isToday ? "#4F46E5" : "#334155",
+                      position: "relative", transition: "all .1s",
+                    }}
+                    onMouseEnter={e => { if (!isSelected) e.currentTarget.style.background = "#F1F5F9"; }}
+                    onMouseLeave={e => { if (!isSelected) e.currentTarget.style.background = isToday ? "#EEF2FF" : "transparent"; }}>
+                    {item.day}
+                    {item.hasEntry && (
+                      <div style={{ position: "absolute", bottom: 2, left: "50%", transform: "translateX(-50%)", width: 5, height: 5, borderRadius: "50%", background: isSelected ? "#FFF" : "#4F46E5" }} />
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+            {/* Quick jump to today */}
+            <div style={{ marginTop: 10, textAlign: "center" }}>
+              <button style={{ ...S.btnOutline, padding: "4px 12px", fontSize: 11 }} onClick={() => { setCalYear(today.getFullYear()); setCalMonth(today.getMonth()); setSelectedDate(today.toISOString().slice(0, 10)); }}>今天</button>
+            </div>
+          </div>
+
+          {/* Recent journals list */}
+          <div style={{ ...S.card, marginTop: 10 }}>
+            <div style={S.h3}>最近日誌</div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 4, maxHeight: 200, overflowY: "auto" }}>
+              {journalsIndex.slice(0, 15).map(j => (
+                <div key={j.date} style={{
+                  padding: "6px 10px", borderRadius: 6, cursor: "pointer", fontSize: 12,
+                  background: j.date === selectedDate ? "#EEF2FF" : "transparent",
+                  fontWeight: j.date === selectedDate ? 600 : 400,
+                  color: j.date === selectedDate ? "#4F46E5" : "#475569",
+                }}
+                  onClick={() => { setSelectedDate(j.date); const dt = new Date(j.date); setCalYear(dt.getFullYear()); setCalMonth(dt.getMonth()); }}>
+                  <div style={S.flexBetween}>
+                    <span>{j.date}</span>
+                    <span style={{ fontSize: 11, color: "#94A3B8", maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{j.title || ""}</span>
+                  </div>
+                </div>
+              ))}
+              {journalsIndex.length === 0 && <div style={{ color: "#CBD5E1", fontSize: 12, textAlign: "center", padding: 10 }}>尚無日誌</div>}
+            </div>
+          </div>
+        </div>
+
+        {/* Right: Journal Content */}
+        <div style={{ flex: 1, maxHeight: "calc(100vh - 200px)", overflowY: "auto" }}>
+          {hasEntry && !currentJournal && (
+            <div style={{ ...S.card, padding: 30, textAlign: "center", color: "#94A3B8" }}>載入中...</div>
+          )}
+
+          {hasEntry && currentJournal && (
+            <div>
+              {/* Header with nav */}
+              <div style={{ ...S.card, padding: 14 }}>
+                <div style={S.flexBetween}>
+                  <div>
+                    <div style={{ fontWeight: 700, fontSize: 18, color: "#1E293B" }}>{currentJournal.title || selectedDate}</div>
+                    <div style={{ fontSize: 12, color: "#94A3B8", marginTop: 2 }}>{selectedDate} · {new Date(selectedDate).toLocaleDateString("zh-TW", { weekday: "long" })}</div>
+                  </div>
+                  <div style={S.flexGap(6)}>
+                    <button style={{ ...S.btnOutline, padding: "6px 12px", fontSize: 16, fontWeight: 700 }} onClick={goPrevEntry} disabled={currentIdx <= 0}>←</button>
+                    <span style={{ fontSize: 12, color: "#94A3B8", minWidth: 50, textAlign: "center" }}>{currentIdx >= 0 ? `${currentIdx + 1}/${sortedDates.length}` : ""}</span>
+                    <button style={{ ...S.btnOutline, padding: "6px 12px", fontSize: 16, fontWeight: 700 }} onClick={goNextEntry} disabled={currentIdx >= sortedDates.length - 1}>→</button>
+                  </div>
+                </div>
+                {(currentJournal.marketTags || []).length > 0 && (
+                  <div style={{ marginTop: 8 }}>{currentJournal.marketTags.map(t => <span key={t} style={S.tag("#FEF3C7", "#92400E")}>📌 {t}</span>)}</div>
+                )}
+              </div>
+
+              {/* Images */}
+              {currentJournal.images && currentJournal.images.length > 0 && (
+                <div style={{ ...S.card, padding: 14 }}>
+                  <div style={S.h3}>截圖 ({currentJournal.images.length})</div>
+                  {currentJournal.images.map((img, i) => (
+                    <img key={i} src={img} alt="" style={{ width: "100%", borderRadius: 7, objectFit: "contain", border: "1px solid #E2E8F0", cursor: "pointer", marginBottom: i < currentJournal.images.length - 1 ? 10 : 0, maxHeight: 400 }} onClick={() => setLightbox(img)} />
+                  ))}
+                </div>
+              )}
+
+              {/* Content */}
+              {currentJournal.content && (
+                <div style={{ ...S.card, padding: 14 }}>
+                  <div style={S.h3}>內容</div>
+                  <div style={{ fontSize: 13, lineHeight: 1.8, whiteSpace: "pre-wrap", color: "#334155" }}>
+                    {currentJournal.content.split(/(#[\w\u4e00-\u9fff\u3400-\u4dbf]+)/g).map((part, i) =>
+                      part.match(/^#[\w\u4e00-\u9fff\u3400-\u4dbf]+$/) ?
+                        <span key={i} style={{ color: "#4F46E5", fontWeight: 600, background: "#EEF2FF", padding: "1px 4px", borderRadius: 3 }}>{part}</span> :
+                        <span key={i}>{part}</span>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* Linked cases */}
+              {renderLinkedCases(currentJournal.linkedCases)}
+
+              {/* Actions */}
+              <div style={{ ...S.card, padding: 14 }}>
+                <div style={S.flexGap(8)}>
+                  <button style={S.btnOutline} onClick={() => onEdit(currentJournal)}><Icon name="edit" size={13} /> 編輯</button>
+                  <button style={{ ...S.btnOutline, color: "#EF4444", borderColor: "#FECACA" }} onClick={() => { onDelete(currentJournal.date); setSelectedDate(selectedDate); }}>
+                    <Icon name="trash" size={13} /> 刪除
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {!hasEntry && (
+            <div style={{ ...S.card, textAlign: "center", padding: 44, color: "#94A3B8" }}>
+              <div style={{ fontSize: 32, marginBottom: 10 }}>📝</div>
+              <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 8 }}>{selectedDate} 尚無日誌</div>
+              <button style={S.btn()} onClick={() => onNew(selectedDate)}>撰寫今日日誌</button>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════
+   JOURNAL FORM
+   ══════════════════════════════════════════════════════════════ */
+function JournalForm({ existing, defaultDate, allMktTags, casesIndex, getPattern, patterns, topPatterns, getChildren, onSave, onCancel }) {
+  const isEdit = !!(existing && existing.content);
+  const [form, setForm] = useState({
+    date: existing?.date || defaultDate || new Date().toISOString().slice(0, 10),
+    title: existing?.title || "",
+    content: existing?.content || "",
+    marketTags: existing?.marketTags || [],
+    images: existing?.images || [],
+    linkedCases: existing?.linkedCases || [],
+    tags: existing?.tags || [],
+  });
+  const [mktTagInput, setMktTagInput] = useState("");
+  const [showSuggestions, setShowSuggestions] = useState(false);
+  const [caseSearchQ, setCaseSearchQ] = useState("");
+  const [compressing, setCompressing] = useState(false);
+  const [formError, setFormError] = useState(null);
+  const fileRef = useRef();
+  const sugRef = useRef();
+
+  const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
+
+  const handleImages = async (e) => {
+    const files = Array.from(e.target.files).slice(0, 10 - form.images.length);
+    if (files.length === 0) return;
+    setCompressing(true);
+    try {
+      const results = await Promise.all(files.map(f => compressImage(f, 1600, 0.9)));
+      setForm(f => ({ ...f, images: [...f.images, ...results].slice(0, 10) }));
+    } catch (err) { console.error("compress err", err); }
+    setCompressing(false);
+    e.target.value = "";
+  };
+
+  const removeImage = (idx) => setForm(f => ({ ...f, images: f.images.filter((_, i) => i !== idx) }));
+
+  const addMarketTag = (t) => {
+    const tag = (t || mktTagInput).trim();
+    if (tag && !form.marketTags.includes(tag)) set("marketTags", [...form.marketTags, tag]);
+    setMktTagInput("");
+    setShowSuggestions(false);
+  };
+
+  const mktSuggestions = useMemo(() => {
+    if (!mktTagInput.trim()) return allMktTags.filter(t => !form.marketTags.includes(t));
+    const lower = mktTagInput.toLowerCase();
+    return allMktTags.filter(t => t.toLowerCase().includes(lower) && !form.marketTags.includes(t));
+  }, [mktTagInput, allMktTags, form.marketTags]);
+
+  // Case linking search
+  const caseResults = useMemo(() => {
+    if (!caseSearchQ.trim()) return [];
+    const lower = caseSearchQ.toLowerCase();
+    return casesIndex.filter(c =>
+      !form.linkedCases.includes(c.id) &&
+      [c.ticker, ...(c.tags || [])].join(" ").toLowerCase().includes(lower)
+    ).slice(0, 8);
+  }, [caseSearchQ, casesIndex, form.linkedCases]);
+
+  useEffect(() => {
+    const handler = (e) => { if (sugRef.current && !sugRef.current.contains(e.target)) setShowSuggestions(false); };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, []);
+
+  const handleSubmit = () => {
+    if (!form.date) { setFormError("請選擇日期"); return; }
+    setFormError(null);
+    const tags = extractTags(form.content);
+    onSave({ ...form, tags });
+  };
+
+  return (
+    <div>
+      <div style={S.h1}>{isEdit ? "編輯日誌" : "新增盤勢日誌"}</div>
+      <div style={S.sub}>{form.date} · {new Date(form.date).toLocaleDateString("zh-TW", { weekday: "long" })}</div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1.2fr 1fr", gap: 20 }}>
+        <div>
+          {/* Basic info */}
+          <div style={S.card}>
+            <div style={S.h3}>基本資訊</div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12 }}>
+              <div>
+                <label style={S.label}>日期 *</label>
+                <input type="date" style={S.input} value={form.date} onChange={e => set("date", e.target.value)} />
+              </div>
+              <div>
+                <label style={S.label}>標題</label>
+                <input style={S.input} value={form.title} onChange={e => set("title", e.target.value)} placeholder="例：大盤突破前高、Fed 利率決議" />
+              </div>
+            </div>
+          </div>
+
+          {/* Content */}
+          <div style={S.card}>
+            <div style={S.h3}>日誌內容</div>
+            <div style={{ fontSize: 11, color: "#94A3B8", marginBottom: 6 }}>使用 #標籤 自動解析</div>
+            <textarea style={{ ...S.textarea, minHeight: 160 }} value={form.content} onChange={e => set("content", e.target.value)} placeholder={"今日盤勢觀察...\n#大盤多頭 #量能萎縮 #外資買超"} />
+            {extractTags(form.content).length > 0 && (
+              <div style={{ marginTop: 6 }}>
+                <span style={{ fontSize: 11, color: "#94A3B8", marginRight: 4 }}>標籤：</span>
+                {extractTags(form.content).map(t => <span key={t} style={S.tag()}>#{t}</span>)}
+              </div>
+            )}
+          </div>
+
+          {/* Market tags */}
+          <div style={S.card}>
+            <div style={S.h3}>市場標籤</div>
+            <div ref={sugRef}>
+              <div style={{ position: "relative" }}>
+                <div style={S.flexGap(6)}>
+                  <input style={{ ...S.input, flex: 1 }} value={mktTagInput}
+                    onChange={e => { setMktTagInput(e.target.value); setShowSuggestions(true); }}
+                    onFocus={() => setShowSuggestions(true)}
+                    placeholder="輸入或選擇已有標籤..."
+                    onKeyDown={e => { if (e.key === "Enter") { e.preventDefault(); addMarketTag(); } }} />
+                  <button style={S.btn()} onClick={() => addMarketTag()}>加入</button>
+                </div>
+                {showSuggestions && mktSuggestions.length > 0 && (
+                  <div style={{
+                    position: "absolute", top: "100%", left: 0, right: 70, marginTop: 2,
+                    background: "#FFF", border: "1px solid #E2E8F0", borderRadius: 7,
+                    boxShadow: "0 4px 16px rgba(0,0,0,0.08)", zIndex: 10, maxHeight: 150, overflowY: "auto"
+                  }}>
+                    <div style={{ padding: "4px 10px", fontSize: 10, color: "#94A3B8", borderBottom: "1px solid #F1F5F9" }}>曾用過的標籤</div>
+                    {mktSuggestions.map(t => (
+                      <div key={t} style={{ padding: "6px 12px", cursor: "pointer", fontSize: 12.5, color: "#334155" }}
+                        onMouseDown={e => { e.preventDefault(); addMarketTag(t); }}
+                        onMouseEnter={e => e.currentTarget.style.background = "#F8FAFC"}
+                        onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+                        📌 {t}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+              {form.marketTags.length > 0 && (
+                <div style={{ marginTop: 6 }}>
+                  {form.marketTags.map(t => (
+                    <span key={t} style={{ ...S.tag("#FEF3C7", "#92400E"), cursor: "pointer" }} onClick={() => set("marketTags", form.marketTags.filter(x => x !== t))}>
+                      📌 {t} ✕
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Link cases */}
+          <div style={S.card}>
+            <div style={S.h3}>🔗 連結案例</div>
+            <input style={{ ...S.input, marginBottom: 8 }} value={caseSearchQ} onChange={e => setCaseSearchQ(e.target.value)} placeholder="搜尋股票代碼以連結案例..." />
+            {caseResults.length > 0 && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 8 }}>
+                {caseResults.map(c => {
+                  const p = getPattern(c.patternId);
+                  return (
+                    <div key={c.id} style={{ ...S.flexBetween, padding: "6px 10px", borderRadius: 6, background: "#F8FAFC", cursor: "pointer" }}
+                      onClick={() => { set("linkedCases", [...form.linkedCases, c.id]); setCaseSearchQ(""); }}>
+                      <div style={S.flexGap(6)}>
+                        {p && <Dot color={p.color} size={7} />}
+                        <span style={{ fontWeight: 600, fontSize: 12 }}>{c.ticker}</span>
+                        {p && <span style={{ fontSize: 10, color: "#94A3B8" }}>{getPatternLabel(p, patterns)}</span>}
+                      </div>
+                      <span style={{ fontSize: 11, color: "#4F46E5" }}>+ 連結</span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            {form.linkedCases.length > 0 && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                {form.linkedCases.map(id => {
+                  const c = casesIndex.find(x => x.id === id);
+                  if (!c) return null;
+                  const p = getPattern(c.patternId);
+                  return (
+                    <div key={id} style={{ ...S.flexBetween, padding: "6px 10px", borderRadius: 6, background: "#EEF2FF" }}>
+                      <div style={S.flexGap(6)}>
+                        {p && <Dot color={p.color} size={7} />}
+                        <span style={{ fontWeight: 600, fontSize: 12 }}>{c.ticker}</span>
+                        {p && <span style={{ fontSize: 10, color: p.color }}>{getPatternLabel(p, patterns)}</span>}
+                        <span style={S.badge(c.result)}>{c.result === "success" ? "成功" : c.result === "failure" ? "失敗" : "觀察"}</span>
+                      </div>
+                      <button style={{ ...S.btnOutline, padding: "2px 8px", fontSize: 11, color: "#EF4444", borderColor: "#FECACA" }}
+                        onClick={() => set("linkedCases", form.linkedCases.filter(x => x !== id))}>移除</button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div>
+          {/* Images */}
+          <div style={S.card}>
+            <div style={S.h3}>截圖（最多 10 張，自動壓縮）</div>
+            <div style={{ fontSize: 11, color: "#94A3B8", marginBottom: 8 }}>已上傳 {form.images.length} / 10 張</div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+              {form.images.map((img, i) => (
+                <div key={i} style={{ position: "relative" }}>
+                  <img src={img} alt="" style={{ width: "100%", borderRadius: 7, objectFit: "cover", border: "1px solid #E2E8F0", maxHeight: 160 }} />
+                  <button onClick={() => removeImage(i)} style={{ position: "absolute", top: 4, right: 4, background: "rgba(0,0,0,0.5)", color: "#FFF", border: "none", borderRadius: "50%", width: 22, height: 22, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11 }}>✕</button>
+                </div>
+              ))}
+            </div>
+            {form.images.length < 10 && (
+              <div onClick={() => !compressing && fileRef.current?.click()} style={{ border: "2px dashed #D1D5DB", borderRadius: 8, padding: 24, textAlign: "center", cursor: compressing ? "wait" : "pointer", color: "#94A3B8", transition: "border-color .15s", marginTop: form.images.length > 0 ? 8 : 0 }}
+                onMouseEnter={e => e.currentTarget.style.borderColor = "#4F46E5"}
+                onMouseLeave={e => e.currentTarget.style.borderColor = "#D1D5DB"}>
+                <Icon name="img" size={24} />
+                <div style={{ marginTop: 4, fontSize: 12, fontWeight: 500 }}>{compressing ? "壓縮中..." : "點擊上傳圖片"}</div>
+                <input ref={fileRef} type="file" accept="image/*" multiple style={{ display: "none" }} onChange={handleImages} />
+              </div>
+            )}
+          </div>
+
+          <div style={{ ...S.flexGap(8), justifyContent: "flex-end", marginTop: 14, flexWrap: "wrap" }}>
+            {formError && <div style={{ width: "100%", textAlign: "right", color: "#DC2626", fontSize: 13, fontWeight: 600, marginBottom: 4 }}>⚠ {formError}</div>}
+            <button style={S.btnOutline} onClick={onCancel}>取消</button>
+            <button style={S.btn()} onClick={handleSubmit}>{isEdit ? "更新日誌" : "儲存日誌"}</button>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
