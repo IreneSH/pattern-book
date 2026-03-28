@@ -1849,13 +1849,24 @@ function JournalView({ journalsIndex, journalStore, loadJournal, casesIndex, cas
 
 /* ══════════════════════════════════════════════════════════════
    JOURNAL FORM — Block-based Editor (text ↔ image interleaved)
+   + auto-expand textarea, undo stack, sticky save bar
    ══════════════════════════════════════════════════════════════ */
+const AutoTextarea = ({ value, onChange, placeholder, style: extraStyle }) => {
+  const ref = useRef();
+  const resize = () => { if (ref.current) { ref.current.style.height = "auto"; ref.current.style.height = ref.current.scrollHeight + "px"; } };
+  useEffect(() => { resize(); }, [value]);
+  return (
+    <textarea ref={ref} style={{ ...S.textarea, minHeight: 48, overflow: "hidden", resize: "none", ...extraStyle }}
+      value={value} onChange={onChange} placeholder={placeholder} onInput={resize} />
+  );
+};
+
 function JournalForm({ existing, defaultDate, allMktTags, casesIndex, getPattern, patterns, topPatterns, getChildren, onSave, onCancel }) {
   const isEdit = !!(existing && existing.blocks);
+  const MAX_UNDO = 50;
 
-  // Initialize blocks from existing or start with one empty text block
   const initBlocks = () => {
-    if (existing?.blocks) return existing.blocks;
+    if (existing?.blocks) return JSON.parse(JSON.stringify(existing.blocks));
     if (existing?.content) {
       const b = [{ type: "text", value: existing.content }];
       if (existing.images) existing.images.forEach(img => b.push({ type: "image", value: img }));
@@ -1878,13 +1889,54 @@ function JournalForm({ existing, defaultDate, allMktTags, casesIndex, getPattern
   const fileRefs = useRef({});
   const sugRef = useRef();
 
+  /* ── Undo stack ── */
+  const undoStack = useRef([]);
+  const debounceTimer = useRef(null);
+
+  const pushUndo = useCallback((snapshot) => {
+    undoStack.current = [...undoStack.current.slice(-MAX_UNDO + 1), JSON.parse(JSON.stringify(snapshot))];
+  }, []);
+
+  // Snapshot before structural changes (insert, delete, move, image add)
+  const snapshotNow = () => { pushUndo(blocks); };
+
+  // Debounced snapshot for text typing (800ms idle)
+  const debouncedSnapshot = useCallback((currentBlocks) => {
+    if (debounceTimer.current) clearTimeout(debounceTimer.current);
+    debounceTimer.current = setTimeout(() => {
+      pushUndo(currentBlocks);
+    }, 800);
+  }, [pushUndo]);
+
+  const undo = useCallback(() => {
+    if (undoStack.current.length === 0) return;
+    const prev = undoStack.current.pop();
+    setBlocks(prev);
+  }, []);
+
+  // Ctrl+Z handler
+  useEffect(() => {
+    const handler = (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === "z" && !e.shiftKey) {
+        e.preventDefault();
+        undo();
+      }
+    };
+    document.addEventListener("keydown", handler);
+    return () => document.removeEventListener("keydown", handler);
+  }, [undo]);
+
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
 
   const updateBlock = (idx, value) => {
-    setBlocks(prev => prev.map((b, i) => i === idx ? { ...b, value } : b));
+    setBlocks(prev => {
+      debouncedSnapshot(prev);
+      return prev.map((b, i) => i === idx ? { ...b, value } : b);
+    });
   };
 
   const removeBlock = (idx) => {
+    snapshotNow();
     setBlocks(prev => {
       const next = prev.filter((_, i) => i !== idx);
       return next.length === 0 ? [{ type: "text", value: "" }] : next;
@@ -1892,35 +1944,32 @@ function JournalForm({ existing, defaultDate, allMktTags, casesIndex, getPattern
   };
 
   const insertImageAt = (afterIdx) => {
-    const id = "fref-" + afterIdx;
-    if (!fileRefs.current[id]) {
-      const input = document.createElement("input");
-      input.type = "file";
-      input.accept = "image/*";
-      input.multiple = true;
-      input.onchange = (e) => {
-        const files = Array.from(e.target.files).slice(0, 10);
-        files.forEach(file => {
-          const reader = new FileReader();
-          reader.onload = (ev) => {
-            setBlocks(prev => {
-              const newBlocks = [...prev];
-              // insert after afterIdx
-              newBlocks.splice(afterIdx + 1, 0, { type: "image", value: ev.target.result });
-              afterIdx++; // shift for multiple files
-              return newBlocks;
-            });
-          };
-          reader.readAsDataURL(file);
-        });
-        input.value = "";
-      };
-      fileRefs.current[id] = input;
-    }
-    fileRefs.current[id].click();
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "image/*";
+    input.multiple = true;
+    input.onchange = (e) => {
+      const files = Array.from(e.target.files).slice(0, 10);
+      snapshotNow();
+      let insertPos = afterIdx;
+      files.forEach(file => {
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+          setBlocks(prev => {
+            const newBlocks = [...prev];
+            insertPos++;
+            newBlocks.splice(insertPos, 0, { type: "image", value: ev.target.result });
+            return newBlocks;
+          });
+        };
+        reader.readAsDataURL(file);
+      });
+    };
+    input.click();
   };
 
   const insertTextAt = (afterIdx) => {
+    snapshotNow();
     setBlocks(prev => {
       const newBlocks = [...prev];
       newBlocks.splice(afterIdx + 1, 0, { type: "text", value: "" });
@@ -1929,6 +1978,7 @@ function JournalForm({ existing, defaultDate, allMktTags, casesIndex, getPattern
   };
 
   const moveBlock = (idx, dir) => {
+    snapshotNow();
     setBlocks(prev => {
       const next = [...prev];
       const target = idx + dir;
@@ -1936,6 +1986,11 @@ function JournalForm({ existing, defaultDate, allMktTags, casesIndex, getPattern
       [next[idx], next[target]] = [next[target], next[idx]];
       return next;
     });
+  };
+
+  const addTextBlockBottom = () => {
+    snapshotNow();
+    setBlocks(prev => [...prev, { type: "text", value: "" }]);
   };
 
   // Market tag helpers
@@ -1967,7 +2022,6 @@ function JournalForm({ existing, defaultDate, allMktTags, casesIndex, getPattern
     return () => document.removeEventListener("mousedown", handler);
   }, []);
 
-  // Extract all tags from all text blocks
   const allTextContent = blocks.filter(b => b.type === "text").map(b => b.value).join("\n");
   const allExtractedTags = extractTags(allTextContent);
   const imageCount = blocks.filter(b => b.type === "image").length;
@@ -1975,17 +2029,14 @@ function JournalForm({ existing, defaultDate, allMktTags, casesIndex, getPattern
   const handleSubmit = () => {
     if (!form.date) { setFormError("請選擇日期"); return; }
     setFormError(null);
-    // Clean empty trailing text blocks but keep at least structure
-    const cleanBlocks = blocks.filter((b, i) => {
+    const cleanBlocks = blocks.filter((b) => {
       if (b.type === "image") return true;
       if (b.value.trim()) return true;
-      // keep if it's the only block
       return blocks.length === 1;
     });
     onSave({ ...form, blocks: cleanBlocks.length > 0 ? cleanBlocks : blocks, tags: allExtractedTags });
   };
 
-  // Block toolbar button style
   const tbBtn = { background: "none", border: "1px solid #E2E8F0", borderRadius: 5, padding: "2px 7px", cursor: "pointer", fontSize: 11, color: "#64748B", fontFamily: font };
 
   return (
@@ -2013,24 +2064,25 @@ function JournalForm({ existing, defaultDate, allMktTags, casesIndex, getPattern
           {/* Block editor */}
           <div style={S.card}>
             <div style={{ ...S.flexBetween, marginBottom: 10 }}>
-              <div style={S.h3}>日誌內容</div>
-              <div style={{ fontSize: 11, color: "#94A3B8" }}>📷 {imageCount} 張圖 · #標籤自動解析</div>
+              <div style={{ ...S.h3, marginBottom: 0 }}>日誌內容</div>
+              <div style={S.flexGap(10)}>
+                <button style={{ ...tbBtn, opacity: undoStack.current.length > 0 ? 1 : 0.35 }} onClick={undo} disabled={undoStack.current.length === 0} title="復原 (Ctrl+Z)">↩ 復原</button>
+                <span style={{ fontSize: 11, color: "#94A3B8" }}>📷 {imageCount} 張圖 · #標籤自動解析</span>
+              </div>
             </div>
 
             {blocks.map((block, idx) => (
-              <div key={idx} style={{ marginBottom: 8 }}>
+              <div key={idx} style={{ marginBottom: 10 }}>
                 {block.type === "text" ? (
-                  <div>
-                    <textarea
-                      style={{ ...S.textarea, minHeight: 80, borderColor: "#E2E8F0" }}
-                      value={block.value}
-                      onChange={e => updateBlock(idx, e.target.value)}
-                      placeholder={idx === 0 ? "開始撰寫今日盤勢觀察...\n使用 #標籤 自動解析" : "繼續撰寫..."}
-                    />
-                  </div>
+                  <AutoTextarea
+                    style={{ borderColor: "#E2E8F0" }}
+                    value={block.value}
+                    onChange={e => updateBlock(idx, e.target.value)}
+                    placeholder={idx === 0 ? "開始撰寫今日盤勢觀察...\n使用 #標籤 自動解析" : "繼續撰寫..."}
+                  />
                 ) : (
                   <div style={{ position: "relative", border: "1px solid #E2E8F0", borderRadius: 7, overflow: "hidden" }}>
-                    <img src={block.value} alt="" style={{ width: "100%", display: "block", objectFit: "contain", maxHeight: 400 }} />
+                    <img src={block.value} alt="" style={{ width: "100%", display: "block", objectFit: "contain", maxHeight: 500 }} />
                   </div>
                 )}
                 {/* Block toolbar */}
@@ -2048,7 +2100,7 @@ function JournalForm({ existing, defaultDate, allMktTags, casesIndex, getPattern
 
             {/* Bottom insert bar */}
             <div style={{ display: "flex", gap: 8, marginTop: 12, justifyContent: "center" }}>
-              <button style={{ ...S.btnOutline, padding: "6px 14px", fontSize: 12 }} onClick={() => setBlocks(prev => [...prev, { type: "text", value: "" }])}>+ 文字段落</button>
+              <button style={{ ...S.btnOutline, padding: "6px 14px", fontSize: 12 }} onClick={addTextBlockBottom}>+ 文字段落</button>
               <button style={{ ...S.btnOutline, padding: "6px 14px", fontSize: 12 }} onClick={() => insertImageAt(blocks.length - 1)}>+ 圖片</button>
             </div>
 
@@ -2060,10 +2112,15 @@ function JournalForm({ existing, defaultDate, allMktTags, casesIndex, getPattern
             )}
           </div>
 
-          <div style={{ ...S.flexGap(8), justifyContent: "flex-end", marginTop: 14 }}>
-            {formError && <div style={{ color: "#DC2626", fontSize: 13, fontWeight: 600, marginRight: "auto" }}>⚠ {formError}</div>}
-            <button style={S.btnOutline} onClick={onCancel}>取消</button>
-            <button style={S.btn()} onClick={handleSubmit}>{isEdit ? "更新日誌" : "儲存日誌"}</button>
+          {/* Sticky save bar */}
+          <div style={{ position: "sticky", bottom: 0, background: "#F4F6FA", paddingTop: 10, paddingBottom: 10, zIndex: 5 }}>
+            <div style={{ ...S.card, padding: "12px 16px", marginBottom: 0, display: "flex", justifyContent: "space-between", alignItems: "center", boxShadow: "0 -2px 12px rgba(0,0,0,0.06)" }}>
+              {formError ? <div style={{ color: "#DC2626", fontSize: 13, fontWeight: 600 }}>⚠ {formError}</div> : <div />}
+              <div style={S.flexGap(8)}>
+                <button style={S.btnOutline} onClick={onCancel}>取消</button>
+                <button style={S.btn()} onClick={handleSubmit}>{isEdit ? "更新日誌" : "儲存日誌"}</button>
+              </div>
+            </div>
           </div>
         </div>
 
