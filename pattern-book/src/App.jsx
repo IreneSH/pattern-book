@@ -8,6 +8,14 @@ const extractTags = (text) => {
   const m = (text||"").match(/#[\w\u4e00-\u9fff\u3400-\u4dbf]+/g);
   return m ? [...new Set(m.map(t => t.slice(1)))] : [];
 };
+const stripHtml = (html) => (html || "").replace(/<[^>]*>/g, "");
+const highlightTagsInHtml = (html) => {
+  // Only process text nodes (content between > and <), leave HTML tags untouched
+  return (html || "").replace(/(^|>)([^<]*)/g, (m, prefix, text) =>
+    prefix + text.replace(/#([\w\u4e00-\u9fff\u3400-\u4dbf]+)/g,
+      '<span style="color:#4F46E5;font-weight:600;background:#EEF2FF;padding:1px 4px;border-radius:3px">#$1</span>')
+  );
+};
 const fmt = (d) => d ? new Date(d).toLocaleDateString("zh-TW", { year: "numeric", month: "2-digit", day: "2-digit" }) : "";
 const pct = (n, d) => d === 0 ? "—" : Math.round((n / d) * 100) + "%";
 
@@ -1675,7 +1683,15 @@ function JournalView({ journalsIndex, journalStore, loadJournal, casesIndex, cas
           <img key={i} src={block.value} alt="" style={{ width: "100%", borderRadius: 7, objectFit: "contain", border: "1px solid #E2E8F0", cursor: "pointer", marginBottom: 14, maxHeight: 500 }} onClick={() => setLightbox(block.value)} />
         );
       }
-      if (block.type === "text" && block.value.trim()) {
+      if (block.type === "text" && stripHtml(block.value).trim()) {
+        // Check if value contains HTML tags (rich text)
+        const hasHtml = /<[a-z][\s\S]*>/i.test(block.value);
+        if (hasHtml) {
+          return (
+            <div key={i} style={{ fontSize: 13.5, lineHeight: 1.85, color: "#334155", marginBottom: 14 }}
+              dangerouslySetInnerHTML={{ __html: highlightTagsInHtml(block.value) }} />
+          );
+        }
         return (
           <div key={i} style={{ fontSize: 13.5, lineHeight: 1.85, whiteSpace: "pre-wrap", color: "#334155", marginBottom: 14 }}>
             {block.value.split(/(#[\w\u4e00-\u9fff\u3400-\u4dbf]+)/g).map((part, j) =>
@@ -1849,15 +1865,90 @@ function JournalView({ journalsIndex, journalStore, loadJournal, casesIndex, cas
 
 /* ══════════════════════════════════════════════════════════════
    JOURNAL FORM — Block-based Editor (text ↔ image interleaved)
-   + auto-expand textarea, undo stack, sticky save bar
+   + auto-expand contentEditable, undo stack, sticky save bar,
+     bold + color formatting
    ══════════════════════════════════════════════════════════════ */
-const AutoTextarea = ({ value, onChange, placeholder, style: extraStyle }) => {
+const RichTextBlock = ({ value, onUpdate, placeholder, onSnapshot }) => {
   const ref = useRef();
-  const resize = () => { if (ref.current) { ref.current.style.height = "auto"; ref.current.style.height = ref.current.scrollHeight + "px"; } };
-  useEffect(() => { resize(); }, [value]);
+  const lastHtml = useRef(value);
+  const isComposing = useRef(false);
+
+  // Only set innerHTML on mount or when value changes from outside (e.g. undo)
+  useEffect(() => {
+    if (ref.current && value !== lastHtml.current) {
+      ref.current.innerHTML = value || "";
+      lastHtml.current = value;
+    }
+  }, [value]);
+
+  const syncContent = () => {
+    if (ref.current && !isComposing.current) {
+      const html = ref.current.innerHTML;
+      if (html !== lastHtml.current) {
+        lastHtml.current = html;
+        onUpdate(html === "<br>" ? "" : html);
+      }
+    }
+  };
+
+  const execFmt = (cmd, val) => {
+    // Save selection, apply, then sync
+    document.execCommand(cmd, false, val || null);
+    ref.current?.focus();
+    syncContent();
+    if (onSnapshot) onSnapshot();
+  };
+
+  const isFormatActive = (cmd) => { try { return document.queryCommandState(cmd); } catch { return false; } };
+
+  const tbStyle = (active) => ({
+    background: active ? "#E2E8F0" : "none", border: "1px solid #E2E8F0", borderRadius: 4,
+    padding: "3px 8px", cursor: "pointer", fontSize: 12, fontFamily: font, lineHeight: 1,
+    fontWeight: 700, color: "#475569", minWidth: 28, textAlign: "center",
+  });
+
+  const colorBtn = (color, label) => ({
+    background: "none", border: "1px solid #E2E8F0", borderRadius: 4,
+    padding: "3px 6px", cursor: "pointer", fontSize: 11, fontFamily: font,
+    color: color, fontWeight: 700, minWidth: 24, textAlign: "center",
+  });
+
   return (
-    <textarea ref={ref} style={{ ...S.textarea, minHeight: 48, overflow: "hidden", resize: "none", ...extraStyle }}
-      value={value} onChange={onChange} placeholder={placeholder} onInput={resize} />
+    <div>
+      {/* Formatting toolbar */}
+      <div style={{ display: "flex", gap: 3, marginBottom: 4, flexWrap: "wrap" }}>
+        <button style={tbStyle(false)} onMouseDown={e => { e.preventDefault(); execFmt("bold"); }} title="粗體">B</button>
+        <div style={{ width: 1, background: "#E2E8F0", margin: "0 3px" }} />
+        <button style={colorBtn("#DC2626", "紅")} onMouseDown={e => { e.preventDefault(); execFmt("foreColor", "#DC2626"); }} title="紅色">A</button>
+        <button style={colorBtn("#059669", "綠")} onMouseDown={e => { e.preventDefault(); execFmt("foreColor", "#059669"); }} title="綠色">A</button>
+        <button style={colorBtn("#2563EB", "藍")} onMouseDown={e => { e.preventDefault(); execFmt("foreColor", "#2563EB"); }} title="藍色">A</button>
+        <button style={colorBtn("#1E293B", "黑")} onMouseDown={e => { e.preventDefault(); execFmt("removeFormat"); }} title="清除格式">A̲</button>
+      </div>
+      {/* Editable area */}
+      <div
+        ref={ref}
+        contentEditable
+        suppressContentEditableWarning
+        onInput={syncContent}
+        onBlur={syncContent}
+        onCompositionStart={() => { isComposing.current = true; }}
+        onCompositionEnd={() => { isComposing.current = false; syncContent(); }}
+        data-placeholder={placeholder}
+        style={{
+          ...S.textarea, minHeight: 48, overflow: "hidden", resize: "none",
+          borderColor: "#E2E8F0", whiteSpace: "pre-wrap", wordBreak: "break-word",
+          outline: "none", lineHeight: 1.7, padding: "9px 11px", color: "#1E293B",
+        }}
+      />
+      {/* CSS for placeholder */}
+      <style>{`
+        [contenteditable][data-placeholder]:empty::before {
+          content: attr(data-placeholder);
+          color: #9CA3AF;
+          pointer-events: none;
+        }
+      `}</style>
+    </div>
   );
 };
 
@@ -2022,7 +2113,7 @@ function JournalForm({ existing, defaultDate, allMktTags, casesIndex, getPattern
     return () => document.removeEventListener("mousedown", handler);
   }, []);
 
-  const allTextContent = blocks.filter(b => b.type === "text").map(b => b.value).join("\n");
+  const allTextContent = blocks.filter(b => b.type === "text").map(b => stripHtml(b.value)).join("\n");
   const allExtractedTags = extractTags(allTextContent);
   const imageCount = blocks.filter(b => b.type === "image").length;
 
@@ -2074,10 +2165,10 @@ function JournalForm({ existing, defaultDate, allMktTags, casesIndex, getPattern
             {blocks.map((block, idx) => (
               <div key={idx} style={{ marginBottom: 10 }}>
                 {block.type === "text" ? (
-                  <AutoTextarea
-                    style={{ borderColor: "#E2E8F0" }}
+                  <RichTextBlock
                     value={block.value}
-                    onChange={e => updateBlock(idx, e.target.value)}
+                    onUpdate={val => updateBlock(idx, val)}
+                    onSnapshot={snapshotNow}
                     placeholder={idx === 0 ? "開始撰寫今日盤勢觀察...\n使用 #標籤 自動解析" : "繼續撰寫..."}
                   />
                 ) : (
