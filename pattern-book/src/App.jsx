@@ -2,22 +2,11 @@ import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { auth, googleProvider, db } from "./firebase.js";
 import { signInWithPopup, signOut, onAuthStateChanged } from "firebase/auth";
 import { doc, getDoc, setDoc, deleteDoc, collection, getDocs } from "firebase/firestore";
-import { getStorage, ref as storageRef, uploadString, getDownloadURL, deleteObject, listAll } from "firebase/storage";
-
-const storage = getStorage(auth.app);
 
 const genId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 const extractTags = (text) => {
   const m = (text||"").match(/#[\w\u4e00-\u9fff\u3400-\u4dbf]+/g);
   return m ? [...new Set(m.map(t => t.slice(1)))] : [];
-};
-const stripHtml = (html) => (html || "").replace(/<[^>]*>/g, "");
-const highlightTagsInHtml = (html) => {
-  // Only process text nodes (content between > and <), leave HTML tags untouched
-  return (html || "").replace(/(^|>)([^<]*)/g, (m, prefix, text) =>
-    prefix + text.replace(/#([\w\u4e00-\u9fff\u3400-\u4dbf]+)/g,
-      '<span style="color:#4F46E5;font-weight:600;background:#EEF2FF;padding:1px 4px;border-radius:3px">#$1</span>')
-  );
 };
 const fmt = (d) => d ? new Date(d).toLocaleDateString("zh-TW", { year: "numeric", month: "2-digit", day: "2-digit" }) : "";
 const pct = (n, d) => d === 0 ? "—" : Math.round((n / d) * 100) + "%";
@@ -89,42 +78,6 @@ function compressImage(file, maxWidth = 1600, quality = 0.9) {
     reader.onerror = reject;
     reader.readAsDataURL(file);
   });
-}
-
-/* ── Firebase Storage Helpers for Journal Images ── */
-const isBase64 = (str) => str && str.startsWith("data:");
-
-async function uploadJournalImages(uid, date, blocks) {
-  const newBlocks = [];
-  for (const block of blocks) {
-    if (block.type === "image" && isBase64(block.value)) {
-      try {
-        const imgId = genId();
-        const path = `users/${uid}/journal-images/${date}/${imgId}`;
-        const ref = storageRef(storage, path);
-        await uploadString(ref, block.value, "data_url");
-        const url = await getDownloadURL(ref);
-        newBlocks.push({ type: "image", value: url });
-      } catch (e) {
-        console.error("upload image err", e);
-        newBlocks.push(block); // keep base64 as fallback
-      }
-    } else {
-      newBlocks.push(block);
-    }
-  }
-  return newBlocks;
-}
-
-async function deleteJournalImages(uid, date) {
-  try {
-    const folderRef = storageRef(storage, `users/${uid}/journal-images/${date}`);
-    const list = await listAll(folderRef);
-    await Promise.all(list.items.map(item => deleteObject(item)));
-  } catch (e) {
-    // folder might not exist, that's fine
-    console.log("delete images (ok if empty):", e.code || e.message);
-  }
 }
 
 /* ── Styles ── */
@@ -252,7 +205,6 @@ function StockDatabook({ userId }) {
   const [journalsIndex, setJournalsIndex] = useState([]);
   const [journalStore, setJournalStore] = useState({});
   const [editingJournal, setEditingJournal] = useState(null);
-  const [journalSaving, setJournalSaving] = useState(false);
 
   const showToast = (msg) => {
     setToastMsg(msg);
@@ -415,32 +367,18 @@ function StockDatabook({ userId }) {
   }, [caseStore, userId]);
 
   /* ── Journal CRUD ── */
-  const saveJournalFn = async (j) => {
-    setJournalSaving(true);
-    try {
-      // Upload base64 images to Firebase Storage, get URLs back
-      const uploadedBlocks = j.blocks ? await uploadJournalImages(userId, j.date, j.blocks) : undefined;
-      const saved = { ...j, ...(uploadedBlocks ? { blocks: uploadedBlocks } : {}) };
-
-      const indexEntry = { date: saved.date, title: saved.title, marketTags: saved.marketTags || [], tags: saved.tags || [], linkedCases: saved.linkedCases || [] };
-      let nextIdx;
-      if (journalsIndex.find(x => x.date === saved.date)) {
-        nextIdx = journalsIndex.map(x => x.date === saved.date ? indexEntry : x);
-      } else {
-        nextIdx = [...journalsIndex, indexEntry].sort((a, b) => b.date.localeCompare(a.date));
-      }
-      setJournalsIndex(nextIdx);
-      setJournalStore(prev => ({ ...prev, [saved.date]: saved }));
-      fsSaveJournalsIndex(userId, nextIdx);
-      await fsSaveJournal(userId, saved);
-      setJournalSaving(false);
-      return true;
-    } catch (e) {
-      console.error("save journal err", e);
-      showToast("⚠ 儲存失敗，請重試");
-      setJournalSaving(false);
-      return false;
+  const saveJournalFn = (j) => {
+    const indexEntry = { date: j.date, title: j.title, marketTags: j.marketTags || [], tags: j.tags || [], linkedCases: j.linkedCases || [] };
+    let nextIdx;
+    if (journalsIndex.find(x => x.date === j.date)) {
+      nextIdx = journalsIndex.map(x => x.date === j.date ? indexEntry : x);
+    } else {
+      nextIdx = [...journalsIndex, indexEntry].sort((a, b) => b.date.localeCompare(a.date));
     }
+    setJournalsIndex(nextIdx);
+    setJournalStore(prev => ({ ...prev, [j.date]: j }));
+    fsSaveJournalsIndex(userId, nextIdx);
+    fsSaveJournal(userId, j);
   };
 
   const deleteJournalFn = (date) => {
@@ -450,7 +388,6 @@ function StockDatabook({ userId }) {
     setJournalStore(prev => { const n = { ...prev }; delete n[date]; return n; });
     fsSaveJournalsIndex(userId, nextIdx);
     fsDeleteJournal(userId, date);
-    deleteJournalImages(userId, date); // clean up Storage
     showToast("已刪除日誌");
   };
 
@@ -459,12 +396,7 @@ function StockDatabook({ userId }) {
     fsLoadJournal(userId, date).then(loaded => {
       if (loaded) {
         setJournalStore(prev => ({ ...prev, [date]: loaded }));
-      } else {
-        // Mark as failed so we don't show "載入中" forever
-        setJournalStore(prev => ({ ...prev, [date]: { _loadError: true, date } }));
       }
-    }).catch(() => {
-      setJournalStore(prev => ({ ...prev, [date]: { _loadError: true, date } }));
     });
   }, [journalStore, userId]);
 
@@ -511,7 +443,7 @@ function StockDatabook({ userId }) {
         {view === VIEWS.STATS && <StatsView patterns={patterns} casesIndex={casesIndex} topPatterns={topPatterns} getChildren={getChildren} allMktTags={allMktTags} />}
         {view === VIEWS.SEARCH && <SearchView casesIndex={casesIndex} caseStore={caseStore} loadCase={loadCaseOnDemand} getPattern={getPattern} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} allMktTags={allMktTags} setLightbox={setLightboxSrc} />}
         {view === VIEWS.JOURNAL && <JournalView journalsIndex={journalsIndex} journalStore={journalStore} loadJournal={loadJournalOnDemand} casesIndex={casesIndex} caseStore={caseStore} loadCase={loadCaseOnDemand} getPattern={getPattern} patterns={patterns} setLightbox={setLightboxSrc} onNew={(date) => { setEditingJournal({ date: date || new Date().toISOString().slice(0,10) }); setView(VIEWS.JOURNAL_EDIT); }} onEdit={(j) => { setEditingJournal(j); setView(VIEWS.JOURNAL_EDIT); }} onDelete={deleteJournalFn} openCase={(id) => { openCase(id); setView(VIEWS.CASES); }} />}
-        {view === VIEWS.JOURNAL_EDIT && <JournalForm existing={editingJournal?.blocks ? editingJournal : (editingJournal?.date && journalStore[editingJournal.date]) || null} defaultDate={editingJournal?.date} allMktTags={allMktTags} casesIndex={casesIndex} getPattern={getPattern} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} saving={journalSaving} onSave={async (j) => { const ok = await saveJournalFn(j); if (ok) { showToast("✓ 日誌已儲存"); setView(VIEWS.JOURNAL); } }} onCancel={() => setView(VIEWS.JOURNAL)} />}
+        {view === VIEWS.JOURNAL_EDIT && <JournalForm existing={editingJournal?.blocks ? editingJournal : (editingJournal?.date && journalStore[editingJournal.date]) || null} defaultDate={editingJournal?.date} allMktTags={allMktTags} casesIndex={casesIndex} getPattern={getPattern} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} onSave={(j) => { saveJournalFn(j); showToast("✓ 日誌已儲存"); setView(VIEWS.JOURNAL); }} onCancel={() => setView(VIEWS.JOURNAL)} />}
       </div>
 
       {patternModal && <PatternModal existing={patternModal.mode === "edit" ? patternModal.pattern : null} parentId={patternModal.parentId || null} patterns={patterns} topPatterns={topPatterns} onSave={savePatternFn} onClose={() => setPatternModal(null)} />}
@@ -1743,15 +1675,7 @@ function JournalView({ journalsIndex, journalStore, loadJournal, casesIndex, cas
           <img key={i} src={block.value} alt="" style={{ width: "100%", borderRadius: 7, objectFit: "contain", border: "1px solid #E2E8F0", cursor: "pointer", marginBottom: 14, maxHeight: 500 }} onClick={() => setLightbox(block.value)} />
         );
       }
-      if (block.type === "text" && stripHtml(block.value).trim()) {
-        // Check if value contains HTML tags (rich text)
-        const hasHtml = /<[a-z][\s\S]*>/i.test(block.value);
-        if (hasHtml) {
-          return (
-            <div key={i} style={{ fontSize: 13.5, lineHeight: 1.85, color: "#334155", marginBottom: 14 }}
-              dangerouslySetInnerHTML={{ __html: highlightTagsInHtml(block.value) }} />
-          );
-        }
+      if (block.type === "text" && block.value.trim()) {
         return (
           <div key={i} style={{ fontSize: 13.5, lineHeight: 1.85, whiteSpace: "pre-wrap", color: "#334155", marginBottom: 14 }}>
             {block.value.split(/(#[\w\u4e00-\u9fff\u3400-\u4dbf]+)/g).map((part, j) =>
@@ -1870,19 +1794,7 @@ function JournalView({ journalsIndex, journalStore, loadJournal, casesIndex, cas
             <div style={{ ...S.card, padding: 30, textAlign: "center", color: "#94A3B8" }}>載入中...</div>
           )}
 
-          {hasEntry && currentJournal && currentJournal._loadError && (
-            <div style={{ ...S.card, padding: 30, textAlign: "center" }}>
-              <div style={{ fontSize: 24, marginBottom: 8 }}>⚠️</div>
-              <div style={{ fontWeight: 600, fontSize: 14, color: "#DC2626", marginBottom: 6 }}>無法載入此日誌</div>
-              <div style={{ fontSize: 12, color: "#94A3B8", marginBottom: 12 }}>可能是圖片太大超過 Firestore 1MB 限制</div>
-              <div style={{ display: "flex", gap: 8, justifyContent: "center" }}>
-                <button style={S.btnOutline} onClick={() => { setJournalStore(prev => { const n = { ...prev }; delete n[selectedDate]; return n; }); }}>重試</button>
-                <button style={{ ...S.btnOutline, color: "#EF4444", borderColor: "#FECACA" }} onClick={() => { onDelete(selectedDate); }}>刪除此日誌</button>
-              </div>
-            </div>
-          )}
-
-          {hasEntry && currentJournal && !currentJournal._loadError && (
+          {hasEntry && currentJournal && (
             <div>
               {/* Header with nav */}
               <div style={{ ...S.card, padding: 14 }}>
@@ -1937,94 +1849,19 @@ function JournalView({ journalsIndex, journalStore, loadJournal, casesIndex, cas
 
 /* ══════════════════════════════════════════════════════════════
    JOURNAL FORM — Block-based Editor (text ↔ image interleaved)
-   + auto-expand contentEditable, undo stack, sticky save bar,
-     bold + color formatting
+   + auto-expand textarea, undo stack, sticky save bar
    ══════════════════════════════════════════════════════════════ */
-const RichTextBlock = ({ value, onUpdate, placeholder, onSnapshot }) => {
+const AutoTextarea = ({ value, onChange, placeholder, style: extraStyle }) => {
   const ref = useRef();
-  const lastHtml = useRef(null);
-  const isComposing = useRef(false);
-
-  // Set innerHTML on mount and when value changes from outside (e.g. undo)
-  useEffect(() => {
-    if (ref.current && value !== lastHtml.current) {
-      ref.current.innerHTML = value || "";
-      lastHtml.current = value;
-    }
-  }, [value]);
-
-  const syncContent = () => {
-    if (ref.current && !isComposing.current) {
-      const html = ref.current.innerHTML;
-      if (html !== lastHtml.current) {
-        lastHtml.current = html;
-        onUpdate(html === "<br>" ? "" : html);
-      }
-    }
-  };
-
-  const execFmt = (cmd, val) => {
-    // Save selection, apply, then sync
-    document.execCommand(cmd, false, val || null);
-    ref.current?.focus();
-    syncContent();
-    if (onSnapshot) onSnapshot();
-  };
-
-  const isFormatActive = (cmd) => { try { return document.queryCommandState(cmd); } catch { return false; } };
-
-  const tbStyle = (active) => ({
-    background: active ? "#E2E8F0" : "none", border: "1px solid #E2E8F0", borderRadius: 4,
-    padding: "3px 8px", cursor: "pointer", fontSize: 12, fontFamily: font, lineHeight: 1,
-    fontWeight: 700, color: "#475569", minWidth: 28, textAlign: "center",
-  });
-
-  const colorBtn = (color, label) => ({
-    background: "none", border: "1px solid #E2E8F0", borderRadius: 4,
-    padding: "3px 6px", cursor: "pointer", fontSize: 11, fontFamily: font,
-    color: color, fontWeight: 700, minWidth: 24, textAlign: "center",
-  });
-
+  const resize = () => { if (ref.current) { ref.current.style.height = "auto"; ref.current.style.height = ref.current.scrollHeight + "px"; } };
+  useEffect(() => { resize(); }, [value]);
   return (
-    <div>
-      {/* Formatting toolbar */}
-      <div style={{ display: "flex", gap: 3, marginBottom: 4, flexWrap: "wrap" }}>
-        <button style={tbStyle(false)} onMouseDown={e => { e.preventDefault(); execFmt("bold"); }} title="粗體">B</button>
-        <div style={{ width: 1, background: "#E2E8F0", margin: "0 3px" }} />
-        <button style={colorBtn("#DC2626", "紅")} onMouseDown={e => { e.preventDefault(); execFmt("foreColor", "#DC2626"); }} title="紅色">A</button>
-        <button style={colorBtn("#059669", "綠")} onMouseDown={e => { e.preventDefault(); execFmt("foreColor", "#059669"); }} title="綠色">A</button>
-        <button style={colorBtn("#2563EB", "藍")} onMouseDown={e => { e.preventDefault(); execFmt("foreColor", "#2563EB"); }} title="藍色">A</button>
-        <button style={colorBtn("#1E293B", "黑")} onMouseDown={e => { e.preventDefault(); execFmt("removeFormat"); }} title="清除格式">A̲</button>
-      </div>
-      {/* Editable area */}
-      <div
-        ref={ref}
-        contentEditable
-        suppressContentEditableWarning
-        onInput={syncContent}
-        onBlur={syncContent}
-        onCompositionStart={() => { isComposing.current = true; }}
-        onCompositionEnd={() => { isComposing.current = false; syncContent(); }}
-        data-placeholder={placeholder}
-        style={{
-          ...S.textarea, minHeight: 48, overflow: "hidden", resize: "none",
-          borderColor: "#E2E8F0", whiteSpace: "pre-wrap", wordBreak: "break-word",
-          outline: "none", lineHeight: 1.7, padding: "9px 11px", color: "#1E293B",
-        }}
-      />
-      {/* CSS for placeholder */}
-      <style>{`
-        [contenteditable][data-placeholder]:empty::before {
-          content: attr(data-placeholder);
-          color: #9CA3AF;
-          pointer-events: none;
-        }
-      `}</style>
-    </div>
+    <textarea ref={ref} style={{ ...S.textarea, minHeight: 48, overflow: "hidden", resize: "none", ...extraStyle }}
+      value={value} onChange={onChange} placeholder={placeholder} onInput={resize} />
   );
 };
 
-function JournalForm({ existing, defaultDate, allMktTags, casesIndex, getPattern, patterns, topPatterns, getChildren, onSave, onCancel, saving }) {
+function JournalForm({ existing, defaultDate, allMktTags, casesIndex, getPattern, patterns, topPatterns, getChildren, onSave, onCancel }) {
   const isEdit = !!(existing && existing.blocks);
   const MAX_UNDO = 50;
 
@@ -2185,7 +2022,7 @@ function JournalForm({ existing, defaultDate, allMktTags, casesIndex, getPattern
     return () => document.removeEventListener("mousedown", handler);
   }, []);
 
-  const allTextContent = blocks.filter(b => b.type === "text").map(b => stripHtml(b.value)).join("\n");
+  const allTextContent = blocks.filter(b => b.type === "text").map(b => b.value).join("\n");
   const allExtractedTags = extractTags(allTextContent);
   const imageCount = blocks.filter(b => b.type === "image").length;
 
@@ -2237,10 +2074,10 @@ function JournalForm({ existing, defaultDate, allMktTags, casesIndex, getPattern
             {blocks.map((block, idx) => (
               <div key={idx} style={{ marginBottom: 10 }}>
                 {block.type === "text" ? (
-                  <RichTextBlock
+                  <AutoTextarea
+                    style={{ borderColor: "#E2E8F0" }}
                     value={block.value}
-                    onUpdate={val => updateBlock(idx, val)}
-                    onSnapshot={snapshotNow}
+                    onChange={e => updateBlock(idx, e.target.value)}
                     placeholder={idx === 0 ? "開始撰寫今日盤勢觀察...\n使用 #標籤 自動解析" : "繼續撰寫..."}
                   />
                 ) : (
@@ -2278,10 +2115,10 @@ function JournalForm({ existing, defaultDate, allMktTags, casesIndex, getPattern
           {/* Sticky save bar */}
           <div style={{ position: "sticky", bottom: 0, background: "#F4F6FA", paddingTop: 10, paddingBottom: 10, zIndex: 5 }}>
             <div style={{ ...S.card, padding: "12px 16px", marginBottom: 0, display: "flex", justifyContent: "space-between", alignItems: "center", boxShadow: "0 -2px 12px rgba(0,0,0,0.06)" }}>
-              {formError ? <div style={{ color: "#DC2626", fontSize: 13, fontWeight: 600 }}>⚠ {formError}</div> : saving ? <div style={{ fontSize: 13, color: "#4F46E5", fontWeight: 600 }}>⏳ 上傳圖片中...</div> : <div />}
+              {formError ? <div style={{ color: "#DC2626", fontSize: 13, fontWeight: 600 }}>⚠ {formError}</div> : <div />}
               <div style={S.flexGap(8)}>
-                <button style={S.btnOutline} onClick={onCancel} disabled={saving}>取消</button>
-                <button style={{ ...S.btn(), opacity: saving ? 0.6 : 1 }} onClick={handleSubmit} disabled={saving}>{saving ? "儲存中..." : isEdit ? "更新日誌" : "儲存日誌"}</button>
+                <button style={S.btnOutline} onClick={onCancel}>取消</button>
+                <button style={S.btn()} onClick={handleSubmit}>{isEdit ? "更新日誌" : "儲存日誌"}</button>
               </div>
             </div>
           </div>
