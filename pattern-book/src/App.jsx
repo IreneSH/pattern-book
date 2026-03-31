@@ -2,7 +2,6 @@ import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { auth, googleProvider, db } from "./firebase.js";
 import { signInWithPopup, signOut, onAuthStateChanged } from "firebase/auth";
 import { doc, getDoc, setDoc, deleteDoc, collection, getDocs } from "firebase/firestore";
-import { TradeListView, TradeDetailView, TradeForm, TradeImport } from "./TradeView.jsx";
 
 const genId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 const extractTags = (text) => {
@@ -13,7 +12,7 @@ const fmt = (d) => d ? new Date(d).toLocaleDateString("zh-TW", { year: "numeric"
 const pct = (n, d) => d === 0 ? "—" : Math.round((n / d) * 100) + "%";
 
 const COLORS = ["#7C8CF8","#60A5FA","#34D399","#FBBF24","#F87171","#A78BFA","#F472B6","#38BDF8","#4ADE80","#FB923C"];
-const VIEWS = { DASH:"dash", PATTERNS:"patterns", CASES:"cases", ADD:"add", EDIT:"edit", STATS:"stats", SEARCH:"search", JOURNAL:"journal", JOURNAL_EDIT:"journal_edit", TRADES:"trades", TRADE_DETAIL:"trade_detail", TRADE_FORM:"trade_form" };
+const VIEWS = { DASH:"dash", PATTERNS:"patterns", CASES:"cases", ADD:"add", EDIT:"edit", STATS:"stats", SEARCH:"search", JOURNAL:"journal", JOURNAL_EDIT:"journal_edit" };
 
 /* ── Firestore Storage Helpers ── */
 async function fsLoadPatterns(uid) {
@@ -56,23 +55,6 @@ async function fsLoadJournal(uid, date) {
 }
 async function fsDeleteJournal(uid, date) {
   try { await deleteDoc(doc(db, "users", uid, "journals", date)); } catch(e) { console.error("delete journal err", e); }
-}
-
-/* ── Trade Firestore Helpers ── */
-async function fsLoadTradesIndex(uid) {
-  try { const snap = await getDoc(doc(db, "users", uid, "data", "tradesIndex")); return snap.exists() ? snap.data().items || [] : []; } catch(e) { console.error("load trades index err", e); return []; }
-}
-async function fsSaveTradesIndex(uid, idx) {
-  try { await setDoc(doc(db, "users", uid, "data", "tradesIndex"), { items: idx }); } catch(e) { console.error("save trades index err", e); }
-}
-async function fsSaveTrade(uid, t) {
-  try { await setDoc(doc(db, "users", uid, "trades", t.id), t); } catch(e) { console.error("save trade err", e); }
-}
-async function fsLoadTrade(uid, id) {
-  try { const snap = await getDoc(doc(db, "users", uid, "trades", id)); return snap.exists() ? snap.data() : null; } catch(e) { console.error("load trade err", e); return null; }
-}
-async function fsDeleteTrade(uid, id) {
-  try { await deleteDoc(doc(db, "users", uid, "trades", id)); } catch(e) { console.error("delete trade err", e); }
 }
 
 /* ── Image Compression ── */
@@ -161,7 +143,6 @@ const Icon = ({ name, size = 17 }) => {
     back: <path d="M19 12H5M12 19l-7-7 7-7"/>,
     subitem: <path d="M9 3v12a3 3 0 003 3h9"/>,
     journal: <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/>,
-    trade: <><path d="M12 2v20M2 12h20"/><path d="M17 7l5 5-5 5M7 7l-5 5 5 5"/></>,
     link: <path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71"/>,
     calendar: <><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></>,
   };
@@ -225,12 +206,6 @@ function StockDatabook({ userId }) {
   const [journalStore, setJournalStore] = useState({});
   const [editingJournal, setEditingJournal] = useState(null);
 
-  const [tradesIndex, setTradesIndex] = useState([]);
-  const [tradeStore, setTradeStore] = useState({});
-  const [selectedTrade, setSelectedTrade] = useState(null);
-  const [editingTrade, setEditingTrade] = useState(null);
-  const [showTradeImport, setShowTradeImport] = useState(false);
-
   const showToast = (msg) => {
     setToastMsg(msg);
     setTimeout(() => setToastMsg(null), 2200);
@@ -240,9 +215,8 @@ function StockDatabook({ userId }) {
     const set = new Set();
     casesIndex.forEach(c => (c.marketTags || []).forEach(t => set.add(t)));
     journalsIndex.forEach(j => (j.marketTags || []).forEach(t => set.add(t)));
-    tradesIndex.forEach(tr => (tr.marketTags || []).forEach(t => set.add(t)));
     return [...set].sort();
-  }, [casesIndex, journalsIndex, tradesIndex]);
+  }, [casesIndex, journalsIndex]);
 
   useEffect(() => {
     let done = false;
@@ -251,8 +225,7 @@ function StockDatabook({ userId }) {
         const p = await fsLoadPatterns(userId);
         const ci = await fsLoadCasesIndex(userId);
         const ji = await fsLoadJournalsIndex(userId);
-        const ti = await fsLoadTradesIndex(userId);
-        if (!done) { setPatterns(p); setCasesIndex(ci); setJournalsIndex(ji); setTradesIndex(ti); }
+        if (!done) { setPatterns(p); setCasesIndex(ci); setJournalsIndex(ji); }
         // No longer loading all cases upfront - they load on demand
       } catch (e) { console.error("Load error:", e); }
       done = true;
@@ -427,87 +400,6 @@ function StockDatabook({ userId }) {
     });
   }, [journalStore, userId]);
 
-  /* ── Trade CRUD ── */
-  const saveTradeFn = (t) => {
-    const indexEntry = {
-      id: t.id, ticker: t.ticker, name: t.name, side: t.side, status: t.status,
-      entryDate: t.entryDate, exitDate: t.exitDate, avgEntry: t.avgEntry, avgExit: t.avgExit,
-      totalShares: t.totalShares, pnl: t.pnl, returnPct: t.returnPct, holdingDays: t.holdingDays,
-      patternId: t.patternId, marketTags: t.marketTags || [], currency: t.currency, txIds: t.txIds || [],
-    };
-    let nextIdx;
-    if (tradesIndex.find(x => x.id === t.id)) {
-      nextIdx = tradesIndex.map(x => x.id === t.id ? indexEntry : x);
-    } else {
-      nextIdx = [...tradesIndex, indexEntry].sort((a, b) => (b.entryDate || "").localeCompare(a.entryDate || ""));
-    }
-    setTradesIndex(nextIdx);
-    setTradeStore(prev => ({ ...prev, [t.id]: t }));
-    fsSaveTradesIndex(userId, nextIdx);
-    fsSaveTrade(userId, t);
-  };
-
-  const importTradesFn = (trades) => {
-    const newIdx = [...tradesIndex];
-    trades.forEach(t => {
-      const indexEntry = {
-        id: t.id, ticker: t.ticker, name: t.name, side: t.side, status: t.status,
-        entryDate: t.entryDate, exitDate: t.exitDate, avgEntry: t.avgEntry, avgExit: t.avgExit,
-        totalShares: t.totalShares, pnl: t.pnl, returnPct: t.returnPct, holdingDays: t.holdingDays,
-        patternId: t.patternId, marketTags: t.marketTags || [], currency: t.currency, txIds: t.txIds || [],
-      };
-      newIdx.push(indexEntry);
-      setTradeStore(prev => ({ ...prev, [t.id]: t }));
-      fsSaveTrade(userId, t);
-    });
-    newIdx.sort((a, b) => (b.entryDate || "").localeCompare(a.entryDate || ""));
-    setTradesIndex(newIdx);
-    fsSaveTradesIndex(userId, newIdx);
-    showToast(`✓ 已匯入 ${trades.length} 筆交易`);
-  };
-
-  const deleteTradeFn = (id) => {
-    if (!confirm("確定刪除這筆交易？")) return;
-    const nextIdx = tradesIndex.filter(x => x.id !== id);
-    setTradesIndex(nextIdx);
-    setTradeStore(prev => { const n = { ...prev }; delete n[id]; return n; });
-    fsSaveTradesIndex(userId, nextIdx);
-    fsDeleteTrade(userId, id);
-    if (selectedTrade?.id === id) setSelectedTrade(null);
-    showToast("已刪除");
-  };
-
-  const loadTradeOnDemand = useCallback((id) => {
-    if (tradeStore[id]) return;
-    fsLoadTrade(userId, id).then(loaded => {
-      if (loaded) setTradeStore(prev => ({ ...prev, [id]: loaded }));
-    });
-  }, [tradeStore, userId]);
-
-  const openTrade = (t) => {
-    const full = tradeStore[t.id];
-    if (full) {
-      setSelectedTrade(full);
-    } else {
-      // Use index data immediately, load full in background
-      setSelectedTrade(t);
-      fsLoadTrade(userId, t.id).then(loaded => {
-        if (loaded) {
-          setTradeStore(prev => ({ ...prev, [t.id]: loaded }));
-          setSelectedTrade(loaded);
-        }
-      });
-    }
-    setView(VIEWS.TRADE_DETAIL);
-  };
-
-  // All txIds for dedup during import
-  const allTxIds = useMemo(() => {
-    const set = new Set();
-    tradesIndex.forEach(t => (t.txIds || []).forEach(id => set.add(id)));
-    return set;
-  }, [tradesIndex]);
-
   const getPattern = (id) => patterns.find(p => p.id === id);
   const topPatterns = useMemo(() => patterns.filter(p => !p.parentId), [patterns]);
   const getChildren = useCallback((pid) => patterns.filter(p => p.parentId === pid), [patterns]);
@@ -530,16 +422,15 @@ function StockDatabook({ userId }) {
             [VIEWS.ADD, "plus", "新增案例"],
             [VIEWS.STATS, "chart", "統計分析"],
             [VIEWS.SEARCH, "search", "搜尋"],
-            [VIEWS.TRADES, "trade", "交易紀錄"],
             [VIEWS.JOURNAL, "journal", "盤勢日誌"],
           ].map(([v, icon, label]) => (
-            <div key={v} style={S.navItem(view === v || (v === VIEWS.JOURNAL && view === VIEWS.JOURNAL_EDIT) || (v === VIEWS.TRADES && (view === VIEWS.TRADE_DETAIL || view === VIEWS.TRADE_FORM)))} onClick={() => { setView(v); if (v === VIEWS.CASES) { setSelectedPatternId(null); setSelectedCase(null); } if (v === VIEWS.TRADES) { setSelectedTrade(null); } }}>
+            <div key={v} style={S.navItem(view === v || (v === VIEWS.JOURNAL && view === VIEWS.JOURNAL_EDIT))} onClick={() => { setView(v); if (v === VIEWS.CASES) { setSelectedPatternId(null); setSelectedCase(null); } }}>
               <Icon name={icon} size={16} /> {label}
             </div>
           ))}
         </nav>
         <div style={{ padding: "0 18px", fontSize: 11, color: "#CBD5E1" }}>
-          {casesIndex.length} 案例 · {tradesIndex.length} 交易 · {journalsIndex.length} 日誌
+          {casesIndex.length} 筆案例 · {patterns.length} 個型態 · {journalsIndex.length} 篇日誌
         </div>
       </div>
 
@@ -553,13 +444,9 @@ function StockDatabook({ userId }) {
         {view === VIEWS.SEARCH && <SearchView casesIndex={casesIndex} caseStore={caseStore} loadCase={loadCaseOnDemand} getPattern={getPattern} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} allMktTags={allMktTags} setLightbox={setLightboxSrc} />}
         {view === VIEWS.JOURNAL && <JournalView journalsIndex={journalsIndex} journalStore={journalStore} loadJournal={loadJournalOnDemand} casesIndex={casesIndex} caseStore={caseStore} loadCase={loadCaseOnDemand} getPattern={getPattern} patterns={patterns} setLightbox={setLightboxSrc} onNew={(date) => { setEditingJournal({ date: date || new Date().toISOString().slice(0,10) }); setView(VIEWS.JOURNAL_EDIT); }} onEdit={(j) => { setEditingJournal(j); setView(VIEWS.JOURNAL_EDIT); }} onDelete={deleteJournalFn} openCase={(id) => { openCase(id); setView(VIEWS.CASES); }} />}
         {view === VIEWS.JOURNAL_EDIT && <JournalForm existing={editingJournal?.blocks ? editingJournal : (editingJournal?.date && journalStore[editingJournal.date]) || null} defaultDate={editingJournal?.date} allMktTags={allMktTags} casesIndex={casesIndex} getPattern={getPattern} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} onSave={(j) => { saveJournalFn(j); showToast("✓ 日誌已儲存"); setView(VIEWS.JOURNAL); }} onCancel={() => setView(VIEWS.JOURNAL)} />}
-        {view === VIEWS.TRADES && <TradeListView trades={tradesIndex} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} getPattern={getPattern} allMktTags={allMktTags} onImport={() => setShowTradeImport(true)} onAdd={() => { setEditingTrade(null); setView(VIEWS.TRADE_FORM); }} onSelect={openTrade} onDelete={deleteTradeFn} />}
-        {view === VIEWS.TRADE_DETAIL && selectedTrade && <TradeDetailView trade={selectedTrade} getPattern={getPattern} patterns={patterns} setLightbox={setLightboxSrc} onEdit={() => { setEditingTrade(selectedTrade); setView(VIEWS.TRADE_FORM); }} onBack={() => setView(VIEWS.TRADES)} onDelete={(id) => { deleteTradeFn(id); setView(VIEWS.TRADES); }} />}
-        {view === VIEWS.TRADE_FORM && <TradeForm existing={editingTrade} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} allMktTags={allMktTags} onSave={(t) => { saveTradeFn(t); showToast("✓ 交易已儲存"); if (editingTrade) { setSelectedTrade(t); setView(VIEWS.TRADE_DETAIL); } else { setView(VIEWS.TRADES); } }} onCancel={() => { setView(editingTrade ? VIEWS.TRADE_DETAIL : VIEWS.TRADES); }} />}
       </div>
 
       {patternModal && <PatternModal existing={patternModal.mode === "edit" ? patternModal.pattern : null} parentId={patternModal.parentId || null} patterns={patterns} topPatterns={topPatterns} onSave={savePatternFn} onClose={() => setPatternModal(null)} />}
-      {showTradeImport && <TradeImport existingTxIds={allTxIds} onImport={importTradesFn} onClose={() => setShowTradeImport(false)} />}
       {lightboxSrc && <Lightbox src={lightboxSrc} onClose={() => setLightboxSrc(null)} />}
       {toastMsg && <div style={{ position: "fixed", top: 20, left: "50%", transform: "translateX(-50%)", background: "#059669", color: "#FFF", padding: "10px 24px", borderRadius: 8, fontSize: 13, fontWeight: 600, zIndex: 1000, boxShadow: "0 4px 12px rgba(0,0,0,0.15)" }}>{toastMsg}</div>}
     </div>
