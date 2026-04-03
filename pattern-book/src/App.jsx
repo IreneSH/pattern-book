@@ -524,6 +524,7 @@ function StockDatabook({ userId }) {
   const [tradesIndex, setTradesIndex] = useState([]);
   const [tradeStore, setTradeStore] = useState({});
   const [selectedTrade, setSelectedTrade] = useState(null);
+  const [selectedTradeId, setSelectedTradeId] = useState(null);
   const [capitalHistory, setCapitalHistory] = useState([]);
 
   const showToast = (msg) => {
@@ -860,7 +861,7 @@ function StockDatabook({ userId }) {
             [VIEWS.JOURNAL, "journal", "盤勢日誌"],
             [VIEWS.TRADES, "trade", "交易紀錄"],
           ].map(([v, icon, label]) => (
-            <div key={v} style={S.navItem(view === v || (v === VIEWS.JOURNAL && view === VIEWS.JOURNAL_EDIT) || (v === VIEWS.TRADES && [VIEWS.TRADE_DETAIL, VIEWS.TRADE_STATS, VIEWS.TRADE_ADD, VIEWS.CAPITAL].includes(view)))} onClick={() => { setView(v); if (v === VIEWS.CASES) { setSelectedPatternId(null); setSelectedCase(null); } if (v === VIEWS.TRADES) { setSelectedTrade(null); } }}>
+            <div key={v} style={S.navItem(view === v || (v === VIEWS.JOURNAL && view === VIEWS.JOURNAL_EDIT) || (v === VIEWS.TRADES && [VIEWS.TRADE_DETAIL, VIEWS.TRADE_STATS, VIEWS.TRADE_ADD, VIEWS.CAPITAL].includes(view)))} onClick={() => { setView(v); if (v === VIEWS.CASES) { setSelectedPatternId(null); setSelectedCase(null); } if (v === VIEWS.TRADES) { setSelectedTrade(null); setSelectedTradeId(null); } }}>
               <Icon name={icon} size={16} /> {label}
             </div>
           ))}
@@ -880,8 +881,8 @@ function StockDatabook({ userId }) {
         {view === VIEWS.SEARCH && <SearchView casesIndex={casesIndex} caseStore={caseStore} loadCase={loadCaseOnDemand} getPattern={getPattern} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} allMktTags={allMktTags} setLightbox={setLightboxSrc} />}
         {view === VIEWS.JOURNAL && <JournalView journalsIndex={journalsIndex} journalStore={journalStore} loadJournal={loadJournalOnDemand} casesIndex={casesIndex} caseStore={caseStore} loadCase={loadCaseOnDemand} getPattern={getPattern} patterns={patterns} setLightbox={setLightboxSrc} onNew={(date) => { setEditingJournal({ date: date || new Date().toISOString().slice(0,10) }); setView(VIEWS.JOURNAL_EDIT); }} onEdit={(j) => { setEditingJournal(j); setView(VIEWS.JOURNAL_EDIT); }} onDelete={deleteJournalFn} openCase={(id) => { openCase(id); setView(VIEWS.CASES); }} />}
         {view === VIEWS.JOURNAL_EDIT && <JournalForm existing={editingJournal?.blocks ? editingJournal : (editingJournal?.date && journalStore[editingJournal.date]) || null} defaultDate={editingJournal?.date} allMktTags={allMktTags} casesIndex={casesIndex} getPattern={getPattern} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} onSave={(j) => { saveJournalFn(j); showToast("✓ 日誌已儲存"); setView(VIEWS.JOURNAL); }} onCancel={() => setView(VIEWS.JOURNAL)} />}
-        {view === VIEWS.TRADES && <TradesView tradesIndex={tradesIndex} tradeStore={tradeStore} loadTrade={loadTradeOnDemand} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} getPattern={getPattern} allMktTags={allMktTags} capitalHistory={capitalHistory} onImport={importTlg} onOpenTrade={async (id) => { await openTrade(id); setView(VIEWS.TRADE_DETAIL); }} onGoStats={() => setView(VIEWS.TRADE_STATS)} onGoAdd={() => setView(VIEWS.TRADE_ADD)} onGoCapital={() => setView(VIEWS.CAPITAL)} showToast={showToast} />}
-        {view === VIEWS.TRADE_DETAIL && <TradeDetailView trade={selectedTrade} tradeStore={tradeStore} tradesIndex={tradesIndex} capitalHistory={capitalHistory} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} getPattern={getPattern} allMktTags={allMktTags} setLightbox={setLightboxSrc} onSave={(t) => { saveTradeFn(t); setSelectedTrade(t); showToast("✓ 已更新"); }} onDelete={() => { if (selectedTrade) { deleteTradeFn(selectedTrade.id); setView(VIEWS.TRADES); } }} onBack={() => setView(VIEWS.TRADES)} />}
+        {view === VIEWS.TRADES && <TradesView tradesIndex={tradesIndex} tradeStore={tradeStore} loadTrade={loadTradeOnDemand} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} getPattern={getPattern} allMktTags={allMktTags} capitalHistory={capitalHistory} onImport={importTlg} onOpenTrade={(id) => { setSelectedTradeId(id); setView(VIEWS.TRADE_DETAIL); }} onGoStats={() => setView(VIEWS.TRADE_STATS)} onGoAdd={() => setView(VIEWS.TRADE_ADD)} onGoCapital={() => setView(VIEWS.CAPITAL)} showToast={showToast} />}
+        {view === VIEWS.TRADE_DETAIL && <TradeDetailView tradeId={selectedTradeId} tradeStore={tradeStore} loadTradeFn={(id) => fsLoadTrade(userId, id)} setTradeStore={setTradeStore} tradesIndex={tradesIndex} capitalHistory={capitalHistory} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} getPattern={getPattern} allMktTags={allMktTags} setLightbox={setLightboxSrc} onSave={(t) => { saveTradeFn(t); showToast("✓ 已更新"); }} onDelete={(id) => { deleteTradeFn(id); setView(VIEWS.TRADES); }} onBack={() => setView(VIEWS.TRADES)} />}
         {view === VIEWS.TRADE_STATS && <TradeStatsView tradesIndex={tradesIndex} tradeStore={tradeStore} loadTrade={loadTradeOnDemand} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} getPattern={getPattern} allMktTags={allMktTags} onBack={() => setView(VIEWS.TRADES)} />}
         {view === VIEWS.TRADE_ADD && <TradeForm patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} allMktTags={allMktTags} onSave={(t) => { saveTradeFn(t); showToast("✓ 新增成功"); setView(VIEWS.TRADES); }} onCancel={() => setView(VIEWS.TRADES)} />}
         {view === VIEWS.CAPITAL && <CapitalView capitalHistory={capitalHistory} onSave={saveCapitalHistory} showToast={showToast} onBack={() => setView(VIEWS.TRADES)} />}
@@ -2980,21 +2981,43 @@ function EquityCurveChart({ data }) {
 /* ══════════════════════════════════════════════════════════════
    TRADE DETAIL VIEW
    ══════════════════════════════════════════════════════════════ */
-function TradeDetailView({ trade, tradeStore, tradesIndex, capitalHistory, patterns, topPatterns, getChildren, getPattern, allMktTags, setLightbox, onSave, onDelete, onBack }) {
+function TradeDetailView({ tradeId, tradeStore, loadTradeFn, setTradeStore, tradesIndex, capitalHistory, patterns, topPatterns, getChildren, getPattern, allMktTags, setLightbox, onSave, onDelete, onBack }) {
+  const [trade, setTrade] = useState(null);
+  const [loading, setLoading] = useState(true);
   const [editing, setEditing] = useState(false);
-  const [notes, setNotes] = useState(trade?.notes || "");
-  const [patternId, setPatternId] = useState(trade?.patternId || "");
-  const [marketTags, setMarketTags] = useState(trade?.marketTags || []);
-  const [images, setImages] = useState(trade?.images || []);
+  const [notes, setNotes] = useState("");
+  const [patternId, setPatternId] = useState("");
+  const [marketTags, setMarketTags] = useState([]);
+  const [images, setImages] = useState([]);
   const [mktTagInput, setMktTagInput] = useState("");
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [newBuy, setNewBuy] = useState(null);
   const [newSell, setNewSell] = useState(null);
-  const [localBuys, setLocalBuys] = useState(trade?.buys || []);
-  const [localSells, setLocalSells] = useState(trade?.sells || []);
+  const [localBuys, setLocalBuys] = useState([]);
+  const [localSells, setLocalSells] = useState([]);
   const fileRef = useRef();
   const sugRef = useRef();
 
+  // Load trade from store or Firestore
+  useEffect(() => {
+    if (!tradeId) { setLoading(false); return; }
+    const cached = tradeStore[tradeId];
+    if (cached) {
+      setTrade(cached);
+      setLoading(false);
+    } else {
+      setLoading(true);
+      loadTradeFn(tradeId).then(loaded => {
+        if (loaded) {
+          setTradeStore(prev => ({ ...prev, [tradeId]: loaded }));
+          setTrade(loaded);
+        }
+        setLoading(false);
+      }).catch(() => setLoading(false));
+    }
+  }, [tradeId]);
+
+  // Sync form state when trade loads/changes
   useEffect(() => {
     if (trade) {
       setNotes(trade.notes || "");
@@ -3027,7 +3050,8 @@ function TradeDetailView({ trade, tradeStore, tradesIndex, capitalHistory, patte
     return () => document.removeEventListener("mousedown", handler);
   }, []);
 
-  if (!trade) return <div style={{ ...S.card, textAlign: "center", padding: 36, color: "#94A3B8" }}>載入中...</div>;
+  if (loading) return <div style={{ ...S.card, textAlign: "center", padding: 36, color: "#94A3B8" }}>載入中...</div>;
+  if (!trade) return <div style={{ ...S.card, textAlign: "center", padding: 36, color: "#94A3B8" }}><div>找不到此交易紀錄</div><button style={{ ...S.btnOutline, marginTop: 12 }} onClick={onBack}>返回</button></div>;
 
   const handleSave = () => {
     const tags = extractTags(notes);
@@ -3055,7 +3079,9 @@ function TradeDetailView({ trade, tradeStore, tradesIndex, capitalHistory, patte
       sells.push({ tradeId: genId(), date: newSell.date, time: "00:00:00", price, quantity: qty, amount: qty * price, commission: 0, exchange: "MANUAL", pnl: Math.round(pnlVal * 100) / 100, pnlPct: Math.round(pnlPctVal * 100) / 100 });
       setNewSell(null);
     }
-    onSave(finalizeTrade({ ...trade, buys, sells, notes, patternId, marketTags, images, tags }));
+    const updated = finalizeTrade({ ...trade, buys, sells, notes, patternId, marketTags, images, tags });
+    setTrade(updated);
+    onSave(updated);
     setEditing(false);
   };
 
@@ -3318,29 +3344,29 @@ function TradeStatsView({ tradesIndex, tradeStore, loadTrade, patterns, topPatte
   }, [ranges]);
 
   // Simple bar chart: X = labels, Y = count
-  const SimpleBarChart = ({ bars, height = 140 }) => {
+  const SimpleBarChart = ({ bars, height = 200 }) => {
     if (!bars || bars.length === 0) return <div style={{ color: "#CBD5E1", fontSize: 11 }}>無資料</div>;
     const maxVal = Math.max(...bars.map(b => b.count), 1);
-    const PL = 28, PR = 8, PT = 12, PB = 40;
+    const PL = 30, PR = 10, PT = 12, PB = 55;
     const bw = Math.max(14, Math.min(28, 500 / bars.length));
     const gap = bw + 4;
     const totalW = PL + PR + bars.length * gap;
     const chartH = height - PT - PB;
-    const ticks = Math.min(maxVal, 5);
+    const ticks = Math.min(maxVal, 6);
 
     return (
       <svg viewBox={`0 0 ${totalW} ${height}`} style={{ width: "100%", height }}>
         {Array.from({ length: ticks + 1 }, (_, i) => {
           const val = maxVal - (maxVal / ticks) * i;
           const y = PT + (chartH / ticks) * i;
-          return <g key={i}><line x1={PL} x2={totalW - PR} y1={y} y2={y} stroke="#F1F5F9" strokeWidth="0.5" /><text x={PL - 4} y={y + 3} textAnchor="end" fontSize="9" fill="#94A3B8">{Math.round(val)}</text></g>;
+          return <g key={i}><line x1={PL} x2={totalW - PR} y1={y} y2={y} stroke="#F1F5F9" strokeWidth="0.5" /><text x={PL - 4} y={y + 3} textAnchor="end" fontSize="10" fill="#94A3B8">{Math.round(val)}</text></g>;
         })}
         {bars.map((b, i) => {
           const x = PL + i * gap;
           const h = maxVal > 0 ? (b.count / maxVal) * chartH : 0;
           return <g key={i}>
             {h > 0 && <rect x={x} y={PT + chartH - h} width={bw} height={h} fill={b.color} rx="2" />}
-            <text x={x + bw / 2} y={height - 4} textAnchor="end" fontSize="8" fill="#94A3B8" transform={`rotate(-45,${x + bw / 2},${height - 4})`}>{b.label}</text>
+            <text x={x + bw / 2} y={PT + chartH + 12} textAnchor="end" fontSize="9" fill="#64748B" transform={`rotate(-45,${x + bw / 2},${PT + chartH + 12})`}>{b.label}</text>
           </g>;
         })}
       </svg>
@@ -3358,11 +3384,11 @@ function TradeStatsView({ tradesIndex, tradeStore, loadTrade, patterns, topPatte
     const usedRanges = drmaRanges.filter((r, i) => i <= Math.max(...drmaRanges.map((rr, j) => (rr.gains > 0 || rr.losses > 0) ? j : 0)));
     const vals = usedRanges.map(r => r.drma);
     const maxAbs = Math.max(...vals.map(Math.abs), 0.01);
-    const PL = 32, PR = 8, PT = 12, PB = 40;
+    const PL = 35, PR = 10, PT = 12, PB = 55;
     const bw = Math.max(14, Math.min(28, 500 / usedRanges.length));
     const gap = bw + 4;
     const totalW = PL + PR + usedRanges.length * gap;
-    const chartH = 100, H = chartH + PT + PB;
+    const chartH = 120, H = chartH + PT + PB;
     const midY = PT + chartH / 2;
     const hasData = vals.some(v => v !== 0);
     if (!hasData) return <div style={{ color: "#CBD5E1", fontSize: 11 }}>無資料</div>;
@@ -3376,7 +3402,7 @@ function TradeStatsView({ tradesIndex, tradeStore, loadTrade, patterns, topPatte
           const y = PT + ratio * chartH;
           return <g key={i}>
             <line x1={PL} x2={totalW - PR} y1={y} y2={y} stroke="#F1F5F9" strokeWidth="0.5" />
-            <text x={PL - 4} y={y + 3} textAnchor="end" fontSize="9" fill="#94A3B8">{val.toFixed(0)}</text>
+            <text x={PL - 4} y={y + 3} textAnchor="end" fontSize="10" fill="#94A3B8">{val.toFixed(0)}</text>
           </g>;
         })}
         <line x1={PL} x2={totalW - PR} y1={midY} y2={midY} stroke="#CBD5E1" strokeWidth="0.8" />
@@ -3386,7 +3412,7 @@ function TradeStatsView({ tradesIndex, tradeStore, loadTrade, patterns, topPatte
           const y = r.drma >= 0 ? midY - h : midY;
           return <g key={i}>
             <rect x={x} y={y} width={bw} height={h} fill={r.drma >= 0 ? "#4F46E5" : "#F87171"} rx="2" />
-            <text x={x + bw / 2} y={H - 4} textAnchor="end" fontSize="8" fill="#94A3B8" transform={`rotate(-45,${x + bw / 2},${H - 4})`}>{r.label}</text>
+            <text x={x + bw / 2} y={PT + chartH + 12} textAnchor="end" fontSize="9" fill="#64748B" transform={`rotate(-45,${x + bw / 2},${PT + chartH + 12})`}>{r.label}</text>
           </g>;
         })}
       </svg>
@@ -3432,10 +3458,10 @@ function TradeStatsView({ tradesIndex, tradeStore, loadTrade, patterns, topPatte
             </div>
           </div>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
-            <div style={S.card}><div style={S.h3}>Gains and Losses</div><SimpleBarChart bars={glDistribution} height={160} /></div>
+            <div style={S.card}><div style={S.h3}>Gains and Losses</div><SimpleBarChart bars={glDistribution} height={220} /></div>
             <div style={S.card}><div style={S.h3}>DRMA Curve</div><DRMAChart /></div>
-            <div style={S.card}><div style={S.h3}>Gain Magnitude</div><SimpleBarChart bars={gainBars} height={140} /></div>
-            <div style={S.card}><div style={S.h3}>Loss Magnitude</div><SimpleBarChart bars={lossBars} height={140} /></div>
+            <div style={S.card}><div style={S.h3}>Gain Magnitude</div><SimpleBarChart bars={gainBars} height={200} /></div>
+            <div style={S.card}><div style={S.h3}>Loss Magnitude</div><SimpleBarChart bars={lossBars} height={200} /></div>
           </div>
           <div style={S.card}>
             <div style={S.h3}>Range Distribution</div>
