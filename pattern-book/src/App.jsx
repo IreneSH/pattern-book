@@ -12,7 +12,7 @@ const fmt = (d) => d ? new Date(d).toLocaleDateString("zh-TW", { year: "numeric"
 const pct = (n, d) => d === 0 ? "—" : Math.round((n / d) * 100) + "%";
 
 const COLORS = ["#7C8CF8","#60A5FA","#34D399","#FBBF24","#F87171","#A78BFA","#F472B6","#38BDF8","#4ADE80","#FB923C"];
-const VIEWS = { DASH:"dash", PATTERNS:"patterns", CASES:"cases", ADD:"add", EDIT:"edit", STATS:"stats", SEARCH:"search", JOURNAL:"journal", JOURNAL_EDIT:"journal_edit" };
+const VIEWS = { DASH:"dash", PATTERNS:"patterns", CASES:"cases", ADD:"add", EDIT:"edit", STATS:"stats", SEARCH:"search", JOURNAL:"journal", JOURNAL_EDIT:"journal_edit", TRADES:"trades", TRADE_DETAIL:"trade_detail", TRADE_STATS:"trade_stats", TRADE_ADD:"trade_add" };
 
 /* ── Firestore Storage Helpers ── */
 async function fsLoadPatterns(uid) {
@@ -55,6 +55,192 @@ async function fsLoadJournal(uid, date) {
 }
 async function fsDeleteJournal(uid, date) {
   try { await deleteDoc(doc(db, "users", uid, "journals", date)); } catch(e) { console.error("delete journal err", e); }
+}
+
+/* ── Trade Firestore Helpers ── */
+async function fsLoadTradesIndex(uid) {
+  try { const snap = await getDoc(doc(db, "users", uid, "data", "tradesIndex")); return snap.exists() ? snap.data().items || [] : []; } catch(e) { console.error("load trades index err", e); return []; }
+}
+async function fsSaveTradesIndex(uid, idx) {
+  try { await setDoc(doc(db, "users", uid, "data", "tradesIndex"), { items: idx }); } catch(e) { console.error("save trades index err", e); }
+}
+async function fsSaveTrade(uid, t) {
+  try { await setDoc(doc(db, "users", uid, "trades", t.id), t); } catch(e) { console.error("save trade err", e); }
+}
+async function fsLoadTrade(uid, id) {
+  try { const snap = await getDoc(doc(db, "users", uid, "trades", id)); return snap.exists() ? snap.data() : null; } catch(e) { console.error("load trade err", e); return null; }
+}
+async function fsDeleteTrade(uid, id) {
+  try { await deleteDoc(doc(db, "users", uid, "trades", id)); } catch(e) { console.error("delete trade err", e); }
+}
+
+/* ── TLG Parser ── */
+function parseTlg(text) {
+  const lines = text.split("\n");
+  const txns = [];
+  for (const line of lines) {
+    if (!line.startsWith("STK_TRD|")) continue;
+    const parts = line.split("|");
+    if (parts.length < 15) continue;
+    const qty = parseFloat(parts[10]);
+    txns.push({
+      tradeId: parts[1],
+      ticker: parts[2],
+      name: parts[3],
+      exchange: parts[4],
+      action: parts[5], // BUYTOOPEN or SELLTOCLOSE
+      openClose: parts[6], // O or C (may have ;IA etc)
+      date: parts[7], // YYYYMMDD
+      time: parts[8],
+      currency: parts[9],
+      quantity: Math.abs(qty),
+      multiplier: parseFloat(parts[11]),
+      price: parseFloat(parts[12]),
+      amount: parseFloat(parts[13]),
+      commission: Math.abs(parseFloat(parts[14])),
+    });
+  }
+  return txns;
+}
+
+function fmtTlgDate(d) {
+  return `${d.slice(0,4)}-${d.slice(4,6)}-${d.slice(6,8)}`;
+}
+
+/* ── FIFO Trade Builder ── */
+function buildTradesFromTxns(txns) {
+  // Group by ticker
+  const byTicker = {};
+  txns.forEach(t => {
+    if (!byTicker[t.ticker]) byTicker[t.ticker] = [];
+    byTicker[t.ticker].push(t);
+  });
+
+  const trades = [];
+
+  Object.entries(byTicker).forEach(([ticker, tickerTxns]) => {
+    // Sort by date + time
+    tickerTxns.sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time));
+
+    let currentTrade = null;
+    let fifoLots = []; // { price, qty, date, commission }
+
+    tickerTxns.forEach(txn => {
+      if (txn.action === "BUYTOOPEN") {
+        if (!currentTrade) {
+          currentTrade = {
+            id: genId(),
+            ticker,
+            name: txn.name,
+            currency: txn.currency,
+            buys: [],
+            sells: [],
+            images: [],
+            notes: "",
+            patternId: "",
+            marketTags: [],
+            tags: [],
+          };
+        }
+        currentTrade.buys.push({
+          tradeId: txn.tradeId,
+          date: fmtTlgDate(txn.date),
+          time: txn.time,
+          price: txn.price,
+          quantity: txn.quantity,
+          amount: Math.abs(txn.amount),
+          commission: txn.commission,
+          exchange: txn.exchange,
+        });
+        fifoLots.push({ price: txn.price, qty: txn.quantity, date: fmtTlgDate(txn.date), commission: txn.commission });
+      } else if (txn.action === "SELLTOCLOSE" && currentTrade) {
+        let remaining = txn.quantity;
+        let costBasis = 0;
+        while (remaining > 0 && fifoLots.length > 0) {
+          const lot = fifoLots[0];
+          const consumed = Math.min(remaining, lot.qty);
+          costBasis += consumed * lot.price;
+          lot.qty -= consumed;
+          remaining -= consumed;
+          if (lot.qty <= 0) fifoLots.shift();
+        }
+        const sellProceeds = txn.quantity * txn.price;
+        const grossPnl = sellProceeds - costBasis;
+        const pnlPctVal = costBasis > 0 ? (grossPnl / costBasis) * 100 : 0;
+
+        currentTrade.sells.push({
+          tradeId: txn.tradeId,
+          date: fmtTlgDate(txn.date),
+          time: txn.time,
+          price: txn.price,
+          quantity: txn.quantity,
+          amount: Math.abs(txn.amount),
+          commission: txn.commission,
+          exchange: txn.exchange,
+          pnl: Math.round(grossPnl * 100) / 100,
+          pnlPct: Math.round(pnlPctVal * 100) / 100,
+        });
+
+        // Check if position is fully closed
+        const totalBought = currentTrade.buys.reduce((s, b) => s + b.quantity, 0);
+        const totalSold = currentTrade.sells.reduce((s, s2) => s + s2.quantity, 0);
+        if (totalSold >= totalBought) {
+          trades.push(finalizeTrade(currentTrade));
+          currentTrade = null;
+          fifoLots = [];
+        }
+      }
+    });
+
+    // If there's an open position remaining
+    if (currentTrade) {
+      trades.push(finalizeTrade(currentTrade));
+    }
+  });
+
+  return trades;
+}
+
+function finalizeTrade(trade) {
+  const totalBuyQty = trade.buys.reduce((s, b) => s + b.quantity, 0);
+  const totalSellQty = trade.sells.reduce((s, s2) => s + s2.quantity, 0);
+  const totalBuyCost = trade.buys.reduce((s, b) => s + b.amount, 0);
+  const totalSellProceeds = trade.sells.reduce((s, s2) => s + s2.amount, 0);
+  const totalBuyComm = trade.buys.reduce((s, b) => s + b.commission, 0);
+  const totalSellComm = trade.sells.reduce((s, s2) => s + s2.commission, 0);
+  const totalCommission = totalBuyComm + totalSellComm;
+  const status = totalSellQty >= totalBuyQty ? "closed" : "open";
+  const remainingQty = totalBuyQty - totalSellQty;
+  const avgBuyPrice = totalBuyQty > 0 ? totalBuyCost / totalBuyQty : 0;
+  const grossPnl = trade.sells.reduce((s, s2) => s + s2.pnl, 0);
+  const pnl = grossPnl - totalCommission;
+  const pnlPct = totalBuyCost > 0 ? (pnl / totalBuyCost) * 100 : 0;
+
+  const openDate = trade.buys.length > 0 ? trade.buys[0].date : "";
+  const closeDate = status === "closed" && trade.sells.length > 0 ? trade.sells[trade.sells.length - 1].date : "";
+  let holdingDays = 0;
+  if (openDate && closeDate) {
+    holdingDays = Math.round((new Date(closeDate) - new Date(openDate)) / (1000 * 60 * 60 * 24));
+  } else if (openDate) {
+    holdingDays = Math.round((new Date() - new Date(openDate)) / (1000 * 60 * 60 * 24));
+  }
+
+  return {
+    ...trade,
+    status,
+    totalBuyQty,
+    totalSellQty,
+    remainingQty,
+    avgBuyPrice: Math.round(avgBuyPrice * 100) / 100,
+    totalBuyCost: Math.round(totalBuyCost * 100) / 100,
+    totalSellProceeds: Math.round(totalSellProceeds * 100) / 100,
+    totalCommission: Math.round(totalCommission * 100) / 100,
+    pnl: Math.round(pnl * 100) / 100,
+    pnlPct: Math.round(pnlPct * 100) / 100,
+    holdingDays,
+    openDate,
+    closeDate,
+  };
 }
 
 /* ── Image Compression ── */
@@ -145,6 +331,7 @@ const Icon = ({ name, size = 17 }) => {
     journal: <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/>,
     link: <path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71"/>,
     calendar: <><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></>,
+    trade: <path d="M12 2v20M17 7l-5-5-5 5M7 17l5 5 5-5M2 12h20"/>,
   };
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none"
@@ -205,6 +392,9 @@ function StockDatabook({ userId }) {
   const [journalsIndex, setJournalsIndex] = useState([]);
   const [journalStore, setJournalStore] = useState({});
   const [editingJournal, setEditingJournal] = useState(null);
+  const [tradesIndex, setTradesIndex] = useState([]);
+  const [tradeStore, setTradeStore] = useState({});
+  const [selectedTrade, setSelectedTrade] = useState(null);
 
   const showToast = (msg) => {
     setToastMsg(msg);
@@ -215,8 +405,9 @@ function StockDatabook({ userId }) {
     const set = new Set();
     casesIndex.forEach(c => (c.marketTags || []).forEach(t => set.add(t)));
     journalsIndex.forEach(j => (j.marketTags || []).forEach(t => set.add(t)));
+    tradesIndex.forEach(t => (t.marketTags || []).forEach(tag => set.add(tag)));
     return [...set].sort();
-  }, [casesIndex, journalsIndex]);
+  }, [casesIndex, journalsIndex, tradesIndex]);
 
   useEffect(() => {
     let done = false;
@@ -225,7 +416,8 @@ function StockDatabook({ userId }) {
         const p = await fsLoadPatterns(userId);
         const ci = await fsLoadCasesIndex(userId);
         const ji = await fsLoadJournalsIndex(userId);
-        if (!done) { setPatterns(p); setCasesIndex(ci); setJournalsIndex(ji); }
+        const ti = await fsLoadTradesIndex(userId);
+        if (!done) { setPatterns(p); setCasesIndex(ci); setJournalsIndex(ji); setTradesIndex(ti); }
         // No longer loading all cases upfront - they load on demand
       } catch (e) { console.error("Load error:", e); }
       done = true;
@@ -400,6 +592,85 @@ function StockDatabook({ userId }) {
     });
   }, [journalStore, userId]);
 
+  /* ── Trade CRUD ── */
+  const saveTradeFn = (t) => {
+    const indexEntry = {
+      id: t.id, ticker: t.ticker, name: t.name, currency: t.currency, status: t.status,
+      pnl: t.pnl, pnlPct: t.pnlPct, holdingDays: t.holdingDays,
+      openDate: t.openDate, closeDate: t.closeDate,
+      avgBuyPrice: t.avgBuyPrice, totalBuyCost: t.totalBuyCost,
+      remainingQty: t.remainingQty, totalBuyQty: t.totalBuyQty, totalSellQty: t.totalSellQty,
+      patternId: t.patternId || "", marketTags: t.marketTags || [], tags: t.tags || [],
+    };
+    let nextIdx;
+    if (tradesIndex.find(x => x.id === t.id)) {
+      nextIdx = tradesIndex.map(x => x.id === t.id ? indexEntry : x);
+    } else {
+      nextIdx = [...tradesIndex, indexEntry];
+    }
+    setTradesIndex(nextIdx);
+    setTradeStore(prev => ({ ...prev, [t.id]: t }));
+    fsSaveTradesIndex(userId, nextIdx);
+    fsSaveTrade(userId, t);
+  };
+
+  const deleteTradeFn = (id) => {
+    if (!confirm("確定刪除這筆交易？")) return;
+    const nextIdx = tradesIndex.filter(x => x.id !== id);
+    setTradesIndex(nextIdx);
+    setTradeStore(prev => { const n = { ...prev }; delete n[id]; return n; });
+    fsSaveTradesIndex(userId, nextIdx);
+    fsDeleteTrade(userId, id);
+    if (selectedTrade?.id === id) setSelectedTrade(null);
+    showToast("已刪除交易");
+  };
+
+  const loadTradeOnDemand = useCallback((id) => {
+    if (tradeStore[id]) return;
+    fsLoadTrade(userId, id).then(loaded => {
+      if (loaded) {
+        setTradeStore(prev => ({ ...prev, [id]: loaded }));
+      }
+    });
+  }, [tradeStore, userId]);
+
+  const openTrade = (id) => {
+    const t = tradeStore[id];
+    if (t) { setSelectedTrade(t); }
+    else {
+      fsLoadTrade(userId, id).then(loaded => {
+        if (loaded) { setTradeStore(prev => ({ ...prev, [id]: loaded })); setSelectedTrade(loaded); }
+      });
+    }
+  };
+
+  const importTlg = (text) => {
+    const txns = parseTlg(text);
+    if (txns.length === 0) { showToast("未找到交易紀錄"); return 0; }
+    const newTrades = buildTradesFromTxns(txns);
+    // Deduplicate by checking existing trade IDs' buy/sell tradeIds
+    const existingTradeIds = new Set();
+    tradesIndex.forEach(t => {
+      const full = tradeStore[t.id];
+      if (full) {
+        (full.buys || []).forEach(b => existingTradeIds.add(b.tradeId));
+        (full.sells || []).forEach(s => existingTradeIds.add(s.tradeId));
+      }
+    });
+
+    let imported = 0;
+    newTrades.forEach(trade => {
+      const allTxnIds = [...trade.buys.map(b => b.tradeId), ...trade.sells.map(s => s.tradeId)];
+      const hasExisting = allTxnIds.some(id => existingTradeIds.has(id));
+      if (!hasExisting) {
+        saveTradeFn(trade);
+        allTxnIds.forEach(id => existingTradeIds.add(id));
+        imported++;
+      }
+    });
+    return imported;
+  };
+
   const getPattern = (id) => patterns.find(p => p.id === id);
   const topPatterns = useMemo(() => patterns.filter(p => !p.parentId), [patterns]);
   const getChildren = useCallback((pid) => patterns.filter(p => p.parentId === pid), [patterns]);
@@ -423,14 +694,15 @@ function StockDatabook({ userId }) {
             [VIEWS.STATS, "chart", "統計分析"],
             [VIEWS.SEARCH, "search", "搜尋"],
             [VIEWS.JOURNAL, "journal", "盤勢日誌"],
+            [VIEWS.TRADES, "trade", "交易紀錄"],
           ].map(([v, icon, label]) => (
-            <div key={v} style={S.navItem(view === v || (v === VIEWS.JOURNAL && view === VIEWS.JOURNAL_EDIT))} onClick={() => { setView(v); if (v === VIEWS.CASES) { setSelectedPatternId(null); setSelectedCase(null); } }}>
+            <div key={v} style={S.navItem(view === v || (v === VIEWS.JOURNAL && view === VIEWS.JOURNAL_EDIT) || (v === VIEWS.TRADES && [VIEWS.TRADE_DETAIL, VIEWS.TRADE_STATS, VIEWS.TRADE_ADD].includes(view)))} onClick={() => { setView(v); if (v === VIEWS.CASES) { setSelectedPatternId(null); setSelectedCase(null); } if (v === VIEWS.TRADES) { setSelectedTrade(null); } }}>
               <Icon name={icon} size={16} /> {label}
             </div>
           ))}
         </nav>
         <div style={{ padding: "0 18px", fontSize: 11, color: "#CBD5E1" }}>
-          {casesIndex.length} 筆案例 · {patterns.length} 個型態 · {journalsIndex.length} 篇日誌
+          {casesIndex.length} 筆案例 · {patterns.length} 個型態 · {journalsIndex.length} 篇日誌 · {tradesIndex.length} 筆交易
         </div>
       </div>
 
@@ -444,6 +716,10 @@ function StockDatabook({ userId }) {
         {view === VIEWS.SEARCH && <SearchView casesIndex={casesIndex} caseStore={caseStore} loadCase={loadCaseOnDemand} getPattern={getPattern} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} allMktTags={allMktTags} setLightbox={setLightboxSrc} />}
         {view === VIEWS.JOURNAL && <JournalView journalsIndex={journalsIndex} journalStore={journalStore} loadJournal={loadJournalOnDemand} casesIndex={casesIndex} caseStore={caseStore} loadCase={loadCaseOnDemand} getPattern={getPattern} patterns={patterns} setLightbox={setLightboxSrc} onNew={(date) => { setEditingJournal({ date: date || new Date().toISOString().slice(0,10) }); setView(VIEWS.JOURNAL_EDIT); }} onEdit={(j) => { setEditingJournal(j); setView(VIEWS.JOURNAL_EDIT); }} onDelete={deleteJournalFn} openCase={(id) => { openCase(id); setView(VIEWS.CASES); }} />}
         {view === VIEWS.JOURNAL_EDIT && <JournalForm existing={editingJournal?.blocks ? editingJournal : (editingJournal?.date && journalStore[editingJournal.date]) || null} defaultDate={editingJournal?.date} allMktTags={allMktTags} casesIndex={casesIndex} getPattern={getPattern} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} onSave={(j) => { saveJournalFn(j); showToast("✓ 日誌已儲存"); setView(VIEWS.JOURNAL); }} onCancel={() => setView(VIEWS.JOURNAL)} />}
+        {view === VIEWS.TRADES && <TradesView tradesIndex={tradesIndex} tradeStore={tradeStore} loadTrade={loadTradeOnDemand} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} getPattern={getPattern} allMktTags={allMktTags} onImport={importTlg} onOpenTrade={(id) => { openTrade(id); setView(VIEWS.TRADE_DETAIL); }} onGoStats={() => setView(VIEWS.TRADE_STATS)} onGoAdd={() => setView(VIEWS.TRADE_ADD)} showToast={showToast} />}
+        {view === VIEWS.TRADE_DETAIL && <TradeDetailView trade={selectedTrade} tradeStore={tradeStore} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} getPattern={getPattern} allMktTags={allMktTags} setLightbox={setLightboxSrc} onSave={(t) => { saveTradeFn(t); setSelectedTrade(t); showToast("✓ 已更新"); }} onDelete={() => { if (selectedTrade) { deleteTradeFn(selectedTrade.id); setView(VIEWS.TRADES); } }} onBack={() => setView(VIEWS.TRADES)} />}
+        {view === VIEWS.TRADE_STATS && <TradeStatsView tradesIndex={tradesIndex} tradeStore={tradeStore} loadTrade={loadTradeOnDemand} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} getPattern={getPattern} allMktTags={allMktTags} onBack={() => setView(VIEWS.TRADES)} />}
+        {view === VIEWS.TRADE_ADD && <TradeForm patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} allMktTags={allMktTags} onSave={(t) => { saveTradeFn(t); showToast("✓ 新增成功"); setView(VIEWS.TRADES); }} onCancel={() => setView(VIEWS.TRADES)} />}
       </div>
 
       {patternModal && <PatternModal existing={patternModal.mode === "edit" ? patternModal.pattern : null} parentId={patternModal.parentId || null} patterns={patterns} topPatterns={topPatterns} onSave={savePatternFn} onClose={() => setPatternModal(null)} />}
@@ -2208,6 +2484,1047 @@ function JournalForm({ existing, defaultDate, allMktTags, casesIndex, getPattern
                 })}
               </div>
             )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════
+   TRADES VIEW — Dashboard
+   ══════════════════════════════════════════════════════════════ */
+function TradesView({ tradesIndex, tradeStore, loadTrade, patterns, topPatterns, getChildren, getPattern, allMktTags, onImport, onOpenTrade, onGoStats, onGoAdd, showToast }) {
+  const [period, setPeriod] = useState("ytd");
+  const [customFrom, setCustomFrom] = useState("");
+  const [customTo, setCustomTo] = useState("");
+  const [patFilter, setPatFilter] = useState("");
+  const [mktFilter, setMktFilter] = useState("");
+  const fileRef = useRef();
+
+  const patternOptions = useMemo(() => {
+    const opts = [];
+    topPatterns.forEach(p => {
+      opts.push({ id: p.id, label: p.name });
+      getChildren(p.id).forEach(c => opts.push({ id: c.id, label: `  └ ${c.name}` }));
+    });
+    return opts;
+  }, [topPatterns, getChildren]);
+
+  const dateRange = useMemo(() => {
+    const now = new Date();
+    let from = "", to = now.toISOString().slice(0, 10);
+    if (period === "ytd") from = `${now.getFullYear()}-01-01`;
+    else if (period === "1m") { const d = new Date(now); d.setMonth(d.getMonth() - 1); from = d.toISOString().slice(0, 10); }
+    else if (period === "3m") { const d = new Date(now); d.setMonth(d.getMonth() - 3); from = d.toISOString().slice(0, 10); }
+    else if (period === "1y") { const d = new Date(now); d.setFullYear(d.getFullYear() - 1); from = d.toISOString().slice(0, 10); }
+    else if (period === "lastMonth") {
+      const d = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+      from = d.toISOString().slice(0, 10);
+      to = new Date(now.getFullYear(), now.getMonth(), 0).toISOString().slice(0, 10);
+    } else if (period === "custom") { from = customFrom; to = customTo; }
+    return { from, to };
+  }, [period, customFrom, customTo]);
+
+  const filtered = useMemo(() => {
+    let list = tradesIndex.filter(t => t.status === "closed");
+    if (dateRange.from) list = list.filter(t => t.closeDate >= dateRange.from);
+    if (dateRange.to) list = list.filter(t => t.closeDate <= dateRange.to);
+    if (patFilter) {
+      const allIds = getDescendantIds(patFilter, patterns);
+      list = list.filter(t => allIds.includes(t.patternId));
+    }
+    if (mktFilter) list = list.filter(t => (t.marketTags || []).includes(mktFilter));
+    return list;
+  }, [tradesIndex, dateRange, patFilter, mktFilter, patterns]);
+
+  const openTrades = useMemo(() => tradesIndex.filter(t => t.status === "open"), [tradesIndex]);
+
+  // Stats
+  const stats = useMemo(() => {
+    if (filtered.length === 0) return null;
+    const wins = filtered.filter(t => t.pnl > 0);
+    const losses = filtered.filter(t => t.pnl <= 0);
+    const totalTrades = filtered.length;
+    const winRate = totalTrades > 0 ? (wins.length / totalTrades) * 100 : 0;
+    const avgGain = wins.length > 0 ? wins.reduce((s, t) => s + t.pnl, 0) / wins.length : 0;
+    const avgLoss = losses.length > 0 ? losses.reduce((s, t) => s + t.pnl, 0) / losses.length : 0;
+    const avgGainPct = wins.length > 0 ? wins.reduce((s, t) => s + t.pnlPct, 0) / wins.length : 0;
+    const avgLossPct = losses.length > 0 ? losses.reduce((s, t) => s + t.pnlPct, 0) / losses.length : 0;
+    const wlRatio = avgLoss !== 0 ? Math.abs(avgGain / avgLoss) : 0;
+    const adjWlRatio = wlRatio * (winRate / 100) / (1 - winRate / 100 || 1);
+    const maxGain = wins.length > 0 ? Math.max(...wins.map(t => t.pnl)) : 0;
+    const maxLoss = losses.length > 0 ? Math.min(...losses.map(t => t.pnl)) : 0;
+    const avgWinDays = wins.length > 0 ? wins.reduce((s, t) => s + (t.holdingDays || 0), 0) / wins.length : 0;
+    const avgLossDays = losses.length > 0 ? losses.reduce((s, t) => s + (t.holdingDays || 0), 0) / losses.length : 0;
+    return { totalTrades, wins: wins.length, losses: losses.length, winRate, avgGain, avgLoss, avgGainPct, avgLossPct, wlRatio, adjWlRatio, maxGain, maxLoss, avgWinDays, avgLossDays };
+  }, [filtered]);
+
+  // Equity curve data
+  const equityCurve = useMemo(() => {
+    const sorted = [...filtered].sort((a, b) => a.closeDate.localeCompare(b.closeDate));
+    let cumPnl = 0;
+    let cumCost = 0;
+    return sorted.map(t => {
+      cumPnl += t.pnl;
+      cumCost += t.totalBuyCost;
+      return { date: t.closeDate, pnl: Math.round(cumPnl * 100) / 100, pct: cumCost > 0 ? Math.round((cumPnl / cumCost) * 10000) / 100 : 0 };
+    });
+  }, [filtered]);
+
+  const handleFileUpload = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const count = onImport(ev.target.result);
+      showToast(`匯入了 ${count} 筆交易`);
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  };
+
+  const recentClosed = useMemo(() => {
+    return [...filtered].sort((a, b) => b.closeDate.localeCompare(a.closeDate)).slice(0, 20);
+  }, [filtered]);
+
+  const fmtMoney = (n) => {
+    if (n === undefined || n === null) return "—";
+    return (n >= 0 ? "+" : "") + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  };
+
+  return (
+    <div>
+      <div style={S.flexBetween}>
+        <div><div style={S.h1}>交易紀錄</div><div style={S.sub}>追蹤你的交易表現</div></div>
+        <div style={S.flexGap(8)}>
+          <button style={S.btnOutline} onClick={onGoStats}>📊 視覺統計</button>
+          <button style={S.btnOutline} onClick={onGoAdd}>✏️ 手動新增</button>
+          <button style={S.btn()} onClick={() => fileRef.current?.click()}>📁 匯入 TLG</button>
+          <input ref={fileRef} type="file" accept=".tlg" style={{ display: "none" }} onChange={handleFileUpload} />
+        </div>
+      </div>
+
+      {/* Filter bar */}
+      <div style={{ ...S.card, ...S.flexGap(10), flexWrap: "wrap", padding: 14 }}>
+        <div>
+          <label style={S.label}>期間</label>
+          <select style={{ ...S.select, width: 130 }} value={period} onChange={e => setPeriod(e.target.value)}>
+            <option value="ytd">YTD</option>
+            <option value="1m">近一個月</option>
+            <option value="3m">近三個月</option>
+            <option value="lastMonth">上個月</option>
+            <option value="1y">近一年</option>
+            <option value="custom">自訂</option>
+          </select>
+        </div>
+        {period === "custom" && <>
+          <div>
+            <label style={S.label}>起始</label>
+            <input type="date" style={{ ...S.input, width: 140 }} value={customFrom} onChange={e => setCustomFrom(e.target.value)} />
+          </div>
+          <div>
+            <label style={S.label}>結束</label>
+            <input type="date" style={{ ...S.input, width: 140 }} value={customTo} onChange={e => setCustomTo(e.target.value)} />
+          </div>
+        </>}
+        <div>
+          <label style={S.label}>型態分類</label>
+          <select style={{ ...S.select, width: 150 }} value={patFilter} onChange={e => setPatFilter(e.target.value)}>
+            <option value="">全部型態</option>
+            {patternOptions.map(o => <option key={o.id} value={o.id}>{o.label}</option>)}
+          </select>
+        </div>
+        <div>
+          <label style={S.label}>市場標籤</label>
+          <select style={{ ...S.select, width: 150 }} value={mktFilter} onChange={e => setMktFilter(e.target.value)}>
+            <option value="">全部標籤</option>
+            {allMktTags.map(t => <option key={t} value={t}>{t}</option>)}
+          </select>
+        </div>
+      </div>
+
+      {/* Stats cards */}
+      {stats && (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 10, marginBottom: 14 }}>
+          <StatCard label="勝率" value={stats.winRate.toFixed(1) + "%"} sub={`${stats.wins}勝 ${stats.losses}負`} color="#059669" />
+          <StatCard label="平均獲利" value={"$" + stats.avgGain.toFixed(0)} sub={stats.avgGainPct.toFixed(2) + "%"} color="#059669" />
+          <StatCard label="平均虧損" value={"$" + stats.avgLoss.toFixed(0)} sub={stats.avgLossPct.toFixed(2) + "%"} color="#DC2626" />
+          <StatCard label="盈虧比" value={stats.wlRatio.toFixed(2)} sub={"調整: " + stats.adjWlRatio.toFixed(2)} color="#4F46E5" />
+          <StatCard label="總交易" value={stats.totalTrades} />
+        </div>
+      )}
+      {stats && (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10, marginBottom: 14 }}>
+          <StatCard label="最大獲利" value={"$" + stats.maxGain.toFixed(0)} color="#059669" />
+          <StatCard label="最大虧損" value={"$" + stats.maxLoss.toFixed(0)} color="#DC2626" />
+          <StatCard label="成功持有天數" value={stats.avgWinDays.toFixed(1)} sub="平均" />
+          <StatCard label="失敗持有天數" value={stats.avgLossDays.toFixed(1)} sub="平均" />
+        </div>
+      )}
+
+      {/* Equity curve */}
+      {equityCurve.length > 1 && (
+        <div style={S.card}>
+          <div style={S.h3}>報酬曲線</div>
+          <EquityCurveChart data={equityCurve} />
+        </div>
+      )}
+
+      {/* Open trades */}
+      {openTrades.length > 0 && (
+        <div style={S.card}>
+          <div style={S.h3}>未平倉部位 ({openTrades.length})</div>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12.5 }}>
+            <thead><tr style={{ borderBottom: "1px solid #E2E8F0" }}>
+              <th style={{ textAlign: "left", padding: "7px 6px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>股票</th>
+              <th style={{ textAlign: "right", padding: "7px 6px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>均價</th>
+              <th style={{ textAlign: "right", padding: "7px 6px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>剩餘股數</th>
+              <th style={{ textAlign: "left", padding: "7px 6px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>開倉日</th>
+              <th style={{ textAlign: "right", padding: "7px 6px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>已實現損益</th>
+              <th style={{ padding: "7px 6px" }}></th>
+            </tr></thead>
+            <tbody>
+              {openTrades.map(t => (
+                <tr key={t.id} style={{ borderBottom: "1px solid #F1F5F9", cursor: "pointer" }} onClick={() => onOpenTrade(t.id)}>
+                  <td style={{ padding: "8px 6px", fontWeight: 600 }}>{t.ticker}</td>
+                  <td style={{ padding: "8px 6px", textAlign: "right" }}>${t.avgBuyPrice}</td>
+                  <td style={{ padding: "8px 6px", textAlign: "right" }}>{t.remainingQty}</td>
+                  <td style={{ padding: "8px 6px" }}>{t.openDate}</td>
+                  <td style={{ padding: "8px 6px", textAlign: "right", fontWeight: 600, color: t.pnl >= 0 ? "#059669" : "#DC2626" }}>{fmtMoney(t.pnl)}</td>
+                  <td style={{ padding: "8px 6px", textAlign: "right", color: "#4F46E5", fontSize: 11 }}>詳情 →</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* Recent closed */}
+      <div style={S.card}>
+        <div style={S.h3}>已平倉交易 ({filtered.length})</div>
+        {recentClosed.length === 0 ? (
+          <div style={{ color: "#CBD5E1", fontSize: 12, textAlign: "center", padding: 20 }}>
+            {tradesIndex.length === 0 ? "尚無交易紀錄，匯入 TLG 檔案或手動新增" : "該期間無已平倉交易"}
+          </div>
+        ) : (
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12.5 }}>
+            <thead><tr style={{ borderBottom: "1px solid #E2E8F0" }}>
+              <th style={{ textAlign: "left", padding: "7px 6px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>股票</th>
+              <th style={{ textAlign: "right", padding: "7px 6px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>損益</th>
+              <th style={{ textAlign: "right", padding: "7px 6px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>損益%</th>
+              <th style={{ textAlign: "right", padding: "7px 6px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>持有天數</th>
+              <th style={{ textAlign: "left", padding: "7px 6px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>平倉日</th>
+              <th style={{ padding: "7px 6px" }}></th>
+            </tr></thead>
+            <tbody>
+              {recentClosed.map(t => {
+                const p = getPattern(t.patternId);
+                return (
+                  <tr key={t.id} style={{ borderBottom: "1px solid #F1F5F9", cursor: "pointer" }} onClick={() => onOpenTrade(t.id)}>
+                    <td style={{ padding: "8px 6px" }}>
+                      <div style={S.flexGap(6)}>
+                        {p && <Dot color={p.color} size={7} />}
+                        <span style={{ fontWeight: 600 }}>{t.ticker}</span>
+                      </div>
+                    </td>
+                    <td style={{ padding: "8px 6px", textAlign: "right", fontWeight: 600, color: t.pnl >= 0 ? "#059669" : "#DC2626" }}>{fmtMoney(t.pnl)}</td>
+                    <td style={{ padding: "8px 6px", textAlign: "right", fontWeight: 600, color: t.pnlPct >= 0 ? "#059669" : "#DC2626" }}>{(t.pnlPct >= 0 ? "+" : "") + t.pnlPct.toFixed(2)}%</td>
+                    <td style={{ padding: "8px 6px", textAlign: "right" }}>{t.holdingDays}天</td>
+                    <td style={{ padding: "8px 6px" }}>{t.closeDate}</td>
+                    <td style={{ padding: "8px 6px", textAlign: "right", color: "#4F46E5", fontSize: 11 }}>詳情 →</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ── Equity Curve SVG Chart ── */
+function EquityCurveChart({ data }) {
+  if (!data || data.length < 2) return null;
+  const W = 800, H = 200, PL = 60, PR = 60, PT = 20, PB = 40;
+  const cw = W - PL - PR, ch = H - PT - PB;
+  const pnls = data.map(d => d.pnl);
+  const pcts = data.map(d => d.pct);
+  const minPnl = Math.min(0, ...pnls), maxPnl = Math.max(0, ...pnls);
+  const rangePnl = maxPnl - minPnl || 1;
+  const minPct = Math.min(0, ...pcts), maxPct = Math.max(0, ...pcts);
+  const rangePct = maxPct - minPct || 1;
+
+  const xStep = cw / (data.length - 1);
+  const yPnl = (v) => PT + ch - ((v - minPnl) / rangePnl) * ch;
+  const yPct = (v) => PT + ch - ((v - minPct) / rangePct) * ch;
+
+  const linePath = data.map((d, i) => `${i === 0 ? "M" : "L"}${PL + i * xStep},${yPnl(d.pnl)}`).join(" ");
+  const areaPath = linePath + ` L${PL + (data.length - 1) * xStep},${yPnl(0)} L${PL},${yPnl(0)} Z`;
+
+  // Y-axis ticks (left: $, right: %)
+  const pnlTicks = 5;
+  const pctTicks = 5;
+
+  // X-axis labels (show ~6 dates)
+  const labelInterval = Math.max(1, Math.floor(data.length / 6));
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "auto" }}>
+      {/* Grid lines */}
+      {Array.from({ length: pnlTicks + 1 }, (_, i) => {
+        const y = PT + (ch / pnlTicks) * i;
+        return <line key={i} x1={PL} x2={W - PR} y1={y} y2={y} stroke="#F1F5F9" strokeWidth="1" />;
+      })}
+      {/* Zero line */}
+      {minPnl < 0 && <line x1={PL} x2={W - PR} y1={yPnl(0)} y2={yPnl(0)} stroke="#CBD5E1" strokeWidth="1" strokeDasharray="4,4" />}
+      {/* Area */}
+      <path d={areaPath} fill="#4F46E520" />
+      {/* Line */}
+      <path d={linePath} fill="none" stroke="#4F46E5" strokeWidth="2" />
+      {/* Left Y-axis labels ($) */}
+      {Array.from({ length: pnlTicks + 1 }, (_, i) => {
+        const val = maxPnl - (rangePnl / pnlTicks) * i;
+        return <text key={`l${i}`} x={PL - 6} y={PT + (ch / pnlTicks) * i + 4} textAnchor="end" fontSize="10" fill="#94A3B8">${Math.round(val).toLocaleString()}</text>;
+      })}
+      {/* Right Y-axis labels (%) */}
+      {Array.from({ length: pctTicks + 1 }, (_, i) => {
+        const val = maxPct - (rangePct / pctTicks) * i;
+        return <text key={`r${i}`} x={W - PR + 6} y={PT + (ch / pctTicks) * i + 4} textAnchor="start" fontSize="10" fill="#94A3B8">{val.toFixed(1)}%</text>;
+      })}
+      {/* X-axis labels */}
+      {data.map((d, i) => {
+        if (i % labelInterval !== 0 && i !== data.length - 1) return null;
+        return <text key={i} x={PL + i * xStep} y={H - 8} textAnchor="middle" fontSize="10" fill="#94A3B8">{d.date.slice(5)}</text>;
+      })}
+      <text x={6} y={PT + ch / 2} textAnchor="middle" fontSize="10" fill="#94A3B8" transform={`rotate(-90,6,${PT + ch / 2})`}>金額 ($)</text>
+      <text x={W - 6} y={PT + ch / 2} textAnchor="middle" fontSize="10" fill="#94A3B8" transform={`rotate(90,${W - 6},${PT + ch / 2})`}>報酬率 (%)</text>
+    </svg>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════
+   TRADE DETAIL VIEW
+   ══════════════════════════════════════════════════════════════ */
+function TradeDetailView({ trade, tradeStore, patterns, topPatterns, getChildren, getPattern, allMktTags, setLightbox, onSave, onDelete, onBack }) {
+  const [editing, setEditing] = useState(false);
+  const [notes, setNotes] = useState(trade?.notes || "");
+  const [patternId, setPatternId] = useState(trade?.patternId || "");
+  const [marketTags, setMarketTags] = useState(trade?.marketTags || []);
+  const [images, setImages] = useState(trade?.images || []);
+  const [mktTagInput, setMktTagInput] = useState("");
+  const [showSuggestions, setShowSuggestions] = useState(false);
+  const fileRef = useRef();
+  const sugRef = useRef();
+
+  // Sync when trade changes
+  useEffect(() => {
+    if (trade) {
+      setNotes(trade.notes || "");
+      setPatternId(trade.patternId || "");
+      setMarketTags(trade.marketTags || []);
+      setImages(trade.images || []);
+    }
+  }, [trade?.id]);
+
+  const patternOptions = useMemo(() => {
+    const opts = [];
+    topPatterns.forEach(p => {
+      opts.push({ id: p.id, label: p.name });
+      getChildren(p.id).forEach(c => opts.push({ id: c.id, label: `  └ ${c.name}` }));
+    });
+    return opts;
+  }, [topPatterns, getChildren]);
+
+  const mktSuggestions = useMemo(() => {
+    if (!mktTagInput.trim()) return allMktTags.filter(t => !marketTags.includes(t));
+    const lower = mktTagInput.toLowerCase();
+    return allMktTags.filter(t => t.toLowerCase().includes(lower) && !marketTags.includes(t));
+  }, [mktTagInput, allMktTags, marketTags]);
+
+  useEffect(() => {
+    const handler = (e) => { if (sugRef.current && !sugRef.current.contains(e.target)) setShowSuggestions(false); };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, []);
+
+  if (!trade) return <div style={{ ...S.card, textAlign: "center", padding: 36, color: "#94A3B8" }}>載入中...</div>;
+
+  const handleSave = () => {
+    const tags = extractTags(notes);
+    onSave({ ...trade, notes, patternId, marketTags, images, tags });
+    setEditing(false);
+  };
+
+  const handleImage = async (e) => {
+    const files = Array.from(e.target.files).slice(0, 2 - images.length);
+    for (const file of files) {
+      const compressed = await compressImage(file);
+      setImages(prev => [...prev, compressed].slice(0, 2));
+    }
+    e.target.value = "";
+  };
+
+  const addMktTag = (t) => {
+    const tag = (t || mktTagInput).trim();
+    if (tag && !marketTags.includes(tag)) setMarketTags(prev => [...prev, tag]);
+    setMktTagInput("");
+    setShowSuggestions(false);
+  };
+
+  const fmtMoney = (n) => (n >= 0 ? "+" : "") + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const pat = getPattern(patternId);
+
+  return (
+    <div>
+      <div style={{ ...S.flexGap(8), marginBottom: 14 }}>
+        <button style={S.btnOutline} onClick={onBack}><Icon name="back" size={14} /> 返回</button>
+      </div>
+
+      {/* Header */}
+      <div style={S.card}>
+        <div style={S.flexBetween}>
+          <div style={S.flexGap(10)}>
+            {pat && <Dot color={pat.color} size={12} />}
+            <span style={{ fontWeight: 700, fontSize: 20 }}>{trade.ticker}</span>
+            <span style={{ fontSize: 13, color: "#94A3B8" }}>{trade.name}</span>
+            <span style={{ ...S.badge(trade.status === "open" ? "pending" : trade.pnl >= 0 ? "success" : "failure") }}>
+              {trade.status === "open" ? "未平倉" : "已平倉"}
+            </span>
+          </div>
+          <div style={S.flexGap(6)}>
+            <button style={S.btnOutline} onClick={() => setEditing(!editing)}><Icon name="edit" size={13} /> {editing ? "取消" : "編輯"}</button>
+            <button style={{ ...S.btnOutline, color: "#EF4444", borderColor: "#FECACA" }} onClick={onDelete}><Icon name="trash" size={13} /></button>
+          </div>
+        </div>
+        {/* Tags */}
+        <div style={{ marginTop: 8, ...S.flexGap(6), flexWrap: "wrap" }}>
+          {pat && <span style={S.tag(pat.color + "22", pat.color)}>{getPatternLabel(pat, patterns)}</span>}
+          {marketTags.map(t => <span key={t} style={S.tag("#FEF3C7", "#92400E")}>📌 {t}</span>)}
+        </div>
+        {/* Summary line */}
+        <div style={{ marginTop: 10, display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 10 }}>
+          <div style={{ textAlign: "center" }}>
+            <div style={{ fontSize: 11, color: "#94A3B8" }}>總損益</div>
+            <div style={{ fontSize: 18, fontWeight: 700, color: trade.pnl >= 0 ? "#059669" : "#DC2626" }}>{fmtMoney(trade.pnl)}</div>
+          </div>
+          <div style={{ textAlign: "center" }}>
+            <div style={{ fontSize: 11, color: "#94A3B8" }}>損益%</div>
+            <div style={{ fontSize: 18, fontWeight: 700, color: trade.pnlPct >= 0 ? "#059669" : "#DC2626" }}>{(trade.pnlPct >= 0 ? "+" : "") + trade.pnlPct.toFixed(2)}%</div>
+          </div>
+          <div style={{ textAlign: "center" }}>
+            <div style={{ fontSize: 11, color: "#94A3B8" }}>持有天數</div>
+            <div style={{ fontSize: 18, fontWeight: 700, color: "#4F46E5" }}>{trade.holdingDays}</div>
+          </div>
+          <div style={{ textAlign: "center" }}>
+            <div style={{ fontSize: 11, color: "#94A3B8" }}>均買價</div>
+            <div style={{ fontSize: 18, fontWeight: 700, color: "#334155" }}>${trade.avgBuyPrice}</div>
+          </div>
+          <div style={{ textAlign: "center" }}>
+            <div style={{ fontSize: 11, color: "#94A3B8" }}>佣金</div>
+            <div style={{ fontSize: 18, fontWeight: 700, color: "#94A3B8" }}>${trade.totalCommission}</div>
+          </div>
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+        {/* Buys */}
+        <div style={S.card}>
+          <div style={S.h3}>買進紀錄 ({trade.buys.length} 筆)</div>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+            <thead><tr style={{ borderBottom: "1px solid #E2E8F0" }}>
+              <th style={{ textAlign: "left", padding: "6px 4px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>日期</th>
+              <th style={{ textAlign: "right", padding: "6px 4px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>價格</th>
+              <th style={{ textAlign: "right", padding: "6px 4px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>股數</th>
+              <th style={{ textAlign: "right", padding: "6px 4px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>金額</th>
+            </tr></thead>
+            <tbody>
+              {trade.buys.map((b, i) => (
+                <tr key={i} style={{ borderBottom: "1px solid #F1F5F9" }}>
+                  <td style={{ padding: "6px 4px" }}>{b.date}</td>
+                  <td style={{ padding: "6px 4px", textAlign: "right" }}>${b.price.toFixed(2)}</td>
+                  <td style={{ padding: "6px 4px", textAlign: "right" }}>{b.quantity}</td>
+                  <td style={{ padding: "6px 4px", textAlign: "right" }}>${b.amount.toFixed(2)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        {/* Sells */}
+        <div style={S.card}>
+          <div style={S.h3}>賣出紀錄 ({trade.sells.length} 筆)</div>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+            <thead><tr style={{ borderBottom: "1px solid #E2E8F0" }}>
+              <th style={{ textAlign: "left", padding: "6px 4px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>日期</th>
+              <th style={{ textAlign: "right", padding: "6px 4px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>價格</th>
+              <th style={{ textAlign: "right", padding: "6px 4px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>股數</th>
+              <th style={{ textAlign: "right", padding: "6px 4px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>損益</th>
+              <th style={{ textAlign: "right", padding: "6px 4px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>損益%</th>
+            </tr></thead>
+            <tbody>
+              {trade.sells.map((s, i) => (
+                <tr key={i} style={{ borderBottom: "1px solid #F1F5F9" }}>
+                  <td style={{ padding: "6px 4px" }}>{s.date}</td>
+                  <td style={{ padding: "6px 4px", textAlign: "right" }}>${s.price.toFixed(2)}</td>
+                  <td style={{ padding: "6px 4px", textAlign: "right" }}>{s.quantity}</td>
+                  <td style={{ padding: "6px 4px", textAlign: "right", fontWeight: 600, color: s.pnl >= 0 ? "#059669" : "#DC2626" }}>{fmtMoney(s.pnl)}</td>
+                  <td style={{ padding: "6px 4px", textAlign: "right", fontWeight: 600, color: s.pnlPct >= 0 ? "#059669" : "#DC2626" }}>{(s.pnlPct >= 0 ? "+" : "") + s.pnlPct.toFixed(2)}%</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Edit section */}
+      {editing && (
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+          <div>
+            <div style={S.card}>
+              <div style={S.h3}>型態分類</div>
+              <select style={S.select} value={patternId} onChange={e => setPatternId(e.target.value)}>
+                <option value="">未分類</option>
+                {patternOptions.map(o => <option key={o.id} value={o.id}>{o.label}</option>)}
+              </select>
+            </div>
+            <div style={S.card}>
+              <div style={S.h3}>市場標籤</div>
+              <div ref={sugRef} style={{ position: "relative" }}>
+                <div style={S.flexGap(6)}>
+                  <input style={{ ...S.input, flex: 1 }} value={mktTagInput}
+                    onChange={e => { setMktTagInput(e.target.value); setShowSuggestions(true); }}
+                    onFocus={() => setShowSuggestions(true)}
+                    placeholder="輸入標籤..."
+                    onKeyDown={e => { if (e.key === "Enter") { e.preventDefault(); addMktTag(); } }} />
+                  <button style={S.btn()} onClick={() => addMktTag()}>加入</button>
+                </div>
+                {showSuggestions && mktSuggestions.length > 0 && (
+                  <div style={{ position: "absolute", top: "100%", left: 0, right: 70, marginTop: 2, background: "#FFF", border: "1px solid #E2E8F0", borderRadius: 7, boxShadow: "0 4px 16px rgba(0,0,0,0.08)", zIndex: 10, maxHeight: 150, overflowY: "auto" }}>
+                    {mktSuggestions.map(t => (
+                      <div key={t} style={{ padding: "6px 12px", cursor: "pointer", fontSize: 12.5 }}
+                        onMouseDown={e => { e.preventDefault(); addMktTag(t); }}
+                        onMouseEnter={e => e.currentTarget.style.background = "#F8FAFC"}
+                        onMouseLeave={e => e.currentTarget.style.background = "transparent"}>📌 {t}</div>
+                    ))}
+                  </div>
+                )}
+              </div>
+              {marketTags.length > 0 && (
+                <div style={{ marginTop: 6 }}>
+                  {marketTags.map(t => (
+                    <span key={t} style={{ ...S.tag("#FEF3C7", "#92400E"), cursor: "pointer" }} onClick={() => setMarketTags(prev => prev.filter(x => x !== t))}>📌 {t} ✕</span>
+                  ))}
+                </div>
+              )}
+            </div>
+            <div style={S.card}>
+              <div style={S.h3}>交易心得</div>
+              <textarea style={{ ...S.textarea, minHeight: 100 }} value={notes} onChange={e => setNotes(e.target.value)} placeholder="記錄你的交易反思... 使用 #標籤" />
+              {extractTags(notes).length > 0 && (
+                <div style={{ marginTop: 6 }}>
+                  {extractTags(notes).map(t => <span key={t} style={S.tag()}>#{t}</span>)}
+                </div>
+              )}
+            </div>
+          </div>
+          <div>
+            <div style={S.card}>
+              <div style={S.h3}>截圖（最多2張）</div>
+              {images.map((img, i) => (
+                <div key={i} style={{ position: "relative", marginBottom: 10 }}>
+                  <img src={img} alt="" style={{ ...S.img, maxHeight: 240 }} onClick={() => setLightbox(img)} />
+                  <button onClick={() => setImages(prev => prev.filter((_, j) => j !== i))} style={{ position: "absolute", top: 6, right: 6, background: "rgba(0,0,0,0.5)", color: "#FFF", border: "none", borderRadius: "50%", width: 26, height: 26, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                    <Icon name="x" size={13} />
+                  </button>
+                </div>
+              ))}
+              {images.length < 2 && (
+                <div onClick={() => fileRef.current?.click()} style={{ border: "2px dashed #D1D5DB", borderRadius: 8, padding: 28, textAlign: "center", cursor: "pointer", color: "#94A3B8" }}>
+                  <Icon name="img" size={28} />
+                  <div style={{ marginTop: 6, fontSize: 12.5, fontWeight: 500 }}>點擊上傳圖片</div>
+                  <input ref={fileRef} type="file" accept="image/*" style={{ display: "none" }} onChange={handleImage} />
+                </div>
+              )}
+            </div>
+            <div style={{ ...S.flexGap(8), justifyContent: "flex-end", marginTop: 10 }}>
+              <button style={S.btnOutline} onClick={() => setEditing(false)}>取消</button>
+              <button style={S.btn()} onClick={handleSave}>儲存</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Show notes/images when not editing */}
+      {!editing && (notes || images.length > 0) && (
+        <div style={{ display: "grid", gridTemplateColumns: images.length > 0 ? "1fr 1fr" : "1fr", gap: 14 }}>
+          {notes && (
+            <div style={S.card}>
+              <div style={S.h3}>交易心得</div>
+              <div style={{ fontSize: 13, lineHeight: 1.7, whiteSpace: "pre-wrap", color: "#334155" }}>
+                {notes.split(/(#[\w\u4e00-\u9fff\u3400-\u4dbf]+)/g).map((part, i) =>
+                  part.match(/^#[\w\u4e00-\u9fff\u3400-\u4dbf]+$/) ?
+                    <span key={i} style={{ color: "#4F46E5", fontWeight: 600, background: "#EEF2FF", padding: "1px 4px", borderRadius: 3 }}>{part}</span> :
+                    <span key={i}>{part}</span>
+                )}
+              </div>
+            </div>
+          )}
+          {images.length > 0 && (
+            <div style={S.card}>
+              <div style={S.h3}>截圖</div>
+              {images.map((img, i) => (
+                <img key={i} src={img} alt="" style={{ ...S.img, maxHeight: 280, marginBottom: i < images.length - 1 ? 10 : 0 }} onClick={() => setLightbox(img)} />
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════
+   TRADE STATS VIEW — Visual Statistics
+   ══════════════════════════════════════════════════════════════ */
+function TradeStatsView({ tradesIndex, tradeStore, loadTrade, patterns, topPatterns, getChildren, getPattern, allMktTags, onBack }) {
+  const [period, setPeriod] = useState("ytd");
+  const [customFrom, setCustomFrom] = useState("");
+  const [customTo, setCustomTo] = useState("");
+  const [patFilter, setPatFilter] = useState("");
+  const [mktFilter, setMktFilter] = useState("");
+
+  const patternOptions = useMemo(() => {
+    const opts = [];
+    topPatterns.forEach(p => {
+      opts.push({ id: p.id, label: p.name });
+      getChildren(p.id).forEach(c => opts.push({ id: c.id, label: `  └ ${c.name}` }));
+    });
+    return opts;
+  }, [topPatterns, getChildren]);
+
+  const dateRange = useMemo(() => {
+    const now = new Date();
+    let from = "", to = now.toISOString().slice(0, 10);
+    if (period === "ytd") from = `${now.getFullYear()}-01-01`;
+    else if (period === "1m") { const d = new Date(now); d.setMonth(d.getMonth() - 1); from = d.toISOString().slice(0, 10); }
+    else if (period === "3m") { const d = new Date(now); d.setMonth(d.getMonth() - 3); from = d.toISOString().slice(0, 10); }
+    else if (period === "1y") { const d = new Date(now); d.setFullYear(d.getFullYear() - 1); from = d.toISOString().slice(0, 10); }
+    else if (period === "lastMonth") {
+      const d = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+      from = d.toISOString().slice(0, 10);
+      to = new Date(now.getFullYear(), now.getMonth(), 0).toISOString().slice(0, 10);
+    } else if (period === "custom") { from = customFrom; to = customTo; }
+    return { from, to };
+  }, [period, customFrom, customTo]);
+
+  const closed = useMemo(() => {
+    let list = tradesIndex.filter(t => t.status === "closed");
+    if (dateRange.from) list = list.filter(t => t.closeDate >= dateRange.from);
+    if (dateRange.to) list = list.filter(t => t.closeDate <= dateRange.to);
+    if (patFilter) {
+      const allIds = getDescendantIds(patFilter, patterns);
+      list = list.filter(t => allIds.includes(t.patternId));
+    }
+    if (mktFilter) list = list.filter(t => (t.marketTags || []).includes(mktFilter));
+    return list.sort((a, b) => a.closeDate.localeCompare(b.closeDate));
+  }, [tradesIndex, dateRange, patFilter, mktFilter, patterns]);
+
+  const wins = closed.filter(t => t.pnl > 0);
+  const losses = closed.filter(t => t.pnl <= 0);
+  const totalTrades = closed.length;
+  const winRate = totalTrades > 0 ? (wins.length / totalTrades * 100) : 0;
+  const avgGain = wins.length > 0 ? wins.reduce((s, t) => s + t.pnlPct, 0) / wins.length : 0;
+  const avgLoss = losses.length > 0 ? losses.reduce((s, t) => s + t.pnlPct, 0) / losses.length : 0;
+  const avgReturn = totalTrades > 0 ? closed.reduce((s, t) => s + t.pnlPct, 0) / totalTrades : 0;
+  const wlRatio = avgLoss !== 0 ? Math.abs(avgGain / avgLoss) : 0;
+  const adjWlRatio = (1 - winRate / 100) !== 0 ? wlRatio * (winRate / 100) / (1 - winRate / 100) : 0;
+
+  // Range distribution (0-2%, 2-4%, ... 36-38%)
+  const ranges = useMemo(() => {
+    const buckets = [];
+    for (let i = 0; i <= 18; i++) {
+      buckets.push({ min: i * 2, max: (i + 1) * 2, gains: 0, losses: 0 });
+    }
+    closed.forEach(t => {
+      const absPct = Math.abs(t.pnlPct);
+      const idx = Math.min(Math.floor(absPct / 2), buckets.length - 1);
+      if (t.pnl > 0) buckets[idx].gains++;
+      else buckets[idx].losses++;
+    });
+    return buckets;
+  }, [closed]);
+
+  // Gains/losses bar chart data
+  const barData = closed.map(t => t.pnlPct);
+
+  // DRMA curve (cumulative R)
+  const drmaData = useMemo(() => {
+    let cum = 0;
+    return closed.map(t => {
+      cum += t.pnlPct;
+      return cum;
+    });
+  }, [closed]);
+
+  // Gain magnitude / loss magnitude
+  const gainMags = wins.map(t => t.pnlPct).sort((a, b) => b - a);
+  const lossMags = losses.map(t => Math.abs(t.pnlPct)).sort((a, b) => b - a);
+
+  const MiniBar = ({ values, color, maxVal }) => {
+    if (values.length === 0) return <div style={{ color: "#CBD5E1", fontSize: 11 }}>無資料</div>;
+    const mx = maxVal || Math.max(...values);
+    const bw = Math.max(6, Math.min(20, 200 / values.length));
+    return (
+      <svg viewBox={`0 0 ${values.length * (bw + 2)} 100`} style={{ width: "100%", height: 80 }}>
+        {values.map((v, i) => {
+          const h = mx > 0 ? (v / mx) * 90 : 0;
+          return <rect key={i} x={i * (bw + 2)} y={100 - h} width={bw} height={h} fill={color} rx="1" />;
+        })}
+      </svg>
+    );
+  };
+
+  return (
+    <div>
+      <div style={S.flexBetween}>
+        <div><div style={S.h1}>視覺統計</div><div style={S.sub}>交易表現分佈分析</div></div>
+        <button style={S.btnOutline} onClick={onBack}><Icon name="back" size={14} /> 返回</button>
+      </div>
+
+      {/* Filters */}
+      <div style={{ ...S.card, ...S.flexGap(10), flexWrap: "wrap", padding: 14 }}>
+        <div>
+          <label style={S.label}>期間</label>
+          <select style={{ ...S.select, width: 130 }} value={period} onChange={e => setPeriod(e.target.value)}>
+            <option value="ytd">YTD</option>
+            <option value="1m">近一個月</option>
+            <option value="3m">近三個月</option>
+            <option value="lastMonth">上個月</option>
+            <option value="1y">近一年</option>
+            <option value="custom">自訂</option>
+          </select>
+        </div>
+        {period === "custom" && <>
+          <div><label style={S.label}>起始</label><input type="date" style={{ ...S.input, width: 140 }} value={customFrom} onChange={e => setCustomFrom(e.target.value)} /></div>
+          <div><label style={S.label}>結束</label><input type="date" style={{ ...S.input, width: 140 }} value={customTo} onChange={e => setCustomTo(e.target.value)} /></div>
+        </>}
+        <div>
+          <label style={S.label}>型態分類</label>
+          <select style={{ ...S.select, width: 150 }} value={patFilter} onChange={e => setPatFilter(e.target.value)}>
+            <option value="">全部</option>
+            {patternOptions.map(o => <option key={o.id} value={o.id}>{o.label}</option>)}
+          </select>
+        </div>
+        <div>
+          <label style={S.label}>市場標籤</label>
+          <select style={{ ...S.select, width: 150 }} value={mktFilter} onChange={e => setMktFilter(e.target.value)}>
+            <option value="">全部</option>
+            {allMktTags.map(t => <option key={t} value={t}>{t}</option>)}
+          </select>
+        </div>
+      </div>
+
+      {totalTrades === 0 ? (
+        <div style={{ ...S.card, textAlign: "center", padding: 36, color: "#94A3B8" }}>該期間無已平倉交易</div>
+      ) : (
+        <>
+          {/* Summary */}
+          <div style={S.card}>
+            <div style={S.h3}>Summary</div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 12, fontSize: 12.5 }}>
+              <div><span style={{ color: "#94A3B8" }}>Total # of Trades:</span> <strong>{totalTrades}</strong></div>
+              <div><span style={{ color: "#94A3B8" }}>Average Gain:</span> <strong style={{ color: "#059669" }}>{avgGain.toFixed(2)}%</strong></div>
+              <div><span style={{ color: "#94A3B8" }}># of Wins:</span> <strong>{wins.length}</strong></div>
+              <div><span style={{ color: "#94A3B8" }}>Batting Average:</span> <strong>{winRate.toFixed(2)}%</strong></div>
+              <div><span style={{ color: "#94A3B8" }}>Average Loss:</span> <strong style={{ color: "#DC2626" }}>{avgLoss.toFixed(2)}%</strong></div>
+              <div><span style={{ color: "#94A3B8" }}># of Losses:</span> <strong>{losses.length}</strong></div>
+              <div><span style={{ color: "#94A3B8" }}>Return Per Trade:</span> <strong>{avgReturn.toFixed(2)}%</strong></div>
+              <div><span style={{ color: "#94A3B8" }}>Win/Loss Ratio:</span> <strong>{wlRatio.toFixed(2)}</strong></div>
+              <div><span style={{ color: "#94A3B8" }}>Adjusted Win/Loss Ratio:</span> <strong>{adjWlRatio.toFixed(2)}</strong></div>
+            </div>
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+            {/* Gains and Losses */}
+            <div style={S.card}>
+              <div style={S.h3}>Gains and Losses</div>
+              <svg viewBox={`0 0 ${barData.length * 18 + 20} 120`} style={{ width: "100%", height: 120 }}>
+                {barData.map((v, i) => {
+                  const maxAbs = Math.max(...barData.map(Math.abs));
+                  const h = maxAbs > 0 ? (Math.abs(v) / maxAbs) * 50 : 0;
+                  const y = v >= 0 ? 60 - h : 60;
+                  return <rect key={i} x={10 + i * 18} y={y} width={14} height={h} fill={v >= 0 ? "#34D399" : "#F87171"} rx="1" />;
+                })}
+                <line x1="0" x2={barData.length * 18 + 20} y1="60" y2="60" stroke="#CBD5E1" strokeWidth="0.5" />
+              </svg>
+            </div>
+
+            {/* DRMA Curve */}
+            <div style={S.card}>
+              <div style={S.h3}>DRMA Curve</div>
+              {drmaData.length > 1 ? (
+                <svg viewBox={`0 0 ${drmaData.length * 18 + 20} 120`} style={{ width: "100%", height: 120 }}>
+                  {drmaData.map((v, i) => {
+                    const maxAbs = Math.max(...drmaData.map(Math.abs));
+                    const h = maxAbs > 0 ? (Math.abs(v) / maxAbs) * 50 : 0;
+                    const base = 60;
+                    const y = v >= 0 ? base - h : base;
+                    return <rect key={i} x={10 + i * 18} y={y} width={14} height={h} fill={v >= 0 ? "#4F46E5" : "#F87171"} rx="1" />;
+                  })}
+                  <line x1="0" x2={drmaData.length * 18 + 20} y1="60" y2="60" stroke="#CBD5E1" strokeWidth="0.5" />
+                </svg>
+              ) : <div style={{ color: "#CBD5E1", fontSize: 11 }}>資料不足</div>}
+            </div>
+
+            {/* Gain Magnitude */}
+            <div style={S.card}>
+              <div style={S.h3}>Gain Magnitude</div>
+              <MiniBar values={gainMags} color="#34D399" />
+            </div>
+
+            {/* Loss Magnitude */}
+            <div style={S.card}>
+              <div style={S.h3}>Loss Magnitude</div>
+              <MiniBar values={lossMags} color="#F87171" />
+            </div>
+          </div>
+
+          {/* Range Table */}
+          <div style={S.card}>
+            <div style={S.h3}>Range Distribution</div>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+              <thead><tr style={{ borderBottom: "2px solid #E2E8F0" }}>
+                <th style={{ textAlign: "left", padding: "8px 6px", color: "#94A3B8", fontWeight: 600, fontSize: 11 }}>Range</th>
+                <th style={{ textAlign: "center", padding: "8px 6px", color: "#94A3B8", fontWeight: 600, fontSize: 11 }}># Gains</th>
+                <th style={{ textAlign: "center", padding: "8px 6px", color: "#94A3B8", fontWeight: 600, fontSize: 11 }}># Losses</th>
+                <th style={{ textAlign: "center", padding: "8px 6px", color: "#059669", fontWeight: 600, fontSize: 11 }}>↗ ↑ %</th>
+                <th style={{ textAlign: "center", padding: "8px 6px", color: "#DC2626", fontWeight: 600, fontSize: 11 }}>↘ ↓ %</th>
+                <th style={{ textAlign: "center", padding: "8px 6px", color: "#94A3B8", fontWeight: 600, fontSize: 11 }}>Net</th>
+                <th style={{ textAlign: "center", padding: "8px 6px", color: "#94A3B8", fontWeight: 600, fontSize: 11 }}>DRMA</th>
+              </tr></thead>
+              <tbody>
+                {ranges.map((r, i) => {
+                  const gPct = totalTrades > 0 ? (r.gains / totalTrades * 100) : 0;
+                  const lPct = totalTrades > 0 ? (r.losses / totalTrades * 100) : 0;
+                  const netPct = gPct - lPct;
+                  const midPct = (r.min + r.max) / 2;
+                  const drma = r.gains * midPct - r.losses * midPct;
+                  const drmaPerTrade = (r.gains + r.losses) > 0 ? drma / (r.gains + r.losses) : 0;
+                  if (r.gains === 0 && r.losses === 0) return (
+                    <tr key={i} style={{ borderBottom: "1px solid #F8FAFC" }}>
+                      <td style={{ padding: "6px", color: "#CBD5E1" }}>{r.min} – {r.max}%</td>
+                      <td style={{ textAlign: "center", padding: "6px", color: "#CBD5E1" }}>0</td>
+                      <td style={{ textAlign: "center", padding: "6px", color: "#CBD5E1" }}>0</td>
+                      <td colSpan={4}></td>
+                    </tr>
+                  );
+                  return (
+                    <tr key={i} style={{ borderBottom: "1px solid #F1F5F9" }}>
+                      <td style={{ padding: "6px", fontWeight: 500 }}>{r.min} – {r.max}%</td>
+                      <td style={{ textAlign: "center", padding: "6px" }}>{r.gains}</td>
+                      <td style={{ textAlign: "center", padding: "6px" }}>{r.losses}</td>
+                      <td style={{ textAlign: "center", padding: "6px" }}>{gPct.toFixed(0)}%</td>
+                      <td style={{ textAlign: "center", padding: "6px" }}>{lPct.toFixed(0)}%</td>
+                      <td style={{ textAlign: "center", padding: "6px", fontWeight: 600, color: netPct >= 0 ? "#059669" : "#DC2626" }}>{netPct >= 0 ? "+" : ""}{netPct.toFixed(2)}%</td>
+                      <td style={{ textAlign: "center", padding: "6px", fontWeight: 600, color: drmaPerTrade >= 0 ? "#059669" : "#DC2626" }}>{drmaPerTrade.toFixed(2)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════
+   TRADE FORM — Manual Add
+   ══════════════════════════════════════════════════════════════ */
+function TradeForm({ patterns, topPatterns, getChildren, allMktTags, onSave, onCancel }) {
+  const [ticker, setTicker] = useState("");
+  const [name, setName] = useState("");
+  const [currency, setCurrency] = useState("USD");
+  const [patternId, setPatternId] = useState("");
+  const [marketTags, setMarketTags] = useState([]);
+  const [notes, setNotes] = useState("");
+  const [buys, setBuys] = useState([{ date: new Date().toISOString().slice(0, 10), price: "", quantity: "" }]);
+  const [sells, setSells] = useState([]);
+  const [mktTagInput, setMktTagInput] = useState("");
+  const [showSuggestions, setShowSuggestions] = useState(false);
+  const [formError, setFormError] = useState(null);
+  const sugRef = useRef();
+
+  const patternOptions = useMemo(() => {
+    const opts = [];
+    topPatterns.forEach(p => {
+      opts.push({ id: p.id, label: p.name });
+      getChildren(p.id).forEach(c => opts.push({ id: c.id, label: `  └ ${c.name}` }));
+    });
+    return opts;
+  }, [topPatterns, getChildren]);
+
+  const mktSuggestions = useMemo(() => {
+    if (!mktTagInput.trim()) return allMktTags.filter(t => !marketTags.includes(t));
+    const lower = mktTagInput.toLowerCase();
+    return allMktTags.filter(t => t.toLowerCase().includes(lower) && !marketTags.includes(t));
+  }, [mktTagInput, allMktTags, marketTags]);
+
+  useEffect(() => {
+    const handler = (e) => { if (sugRef.current && !sugRef.current.contains(e.target)) setShowSuggestions(false); };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, []);
+
+  const addMktTag = (t) => {
+    const tag = (t || mktTagInput).trim();
+    if (tag && !marketTags.includes(tag)) setMarketTags(prev => [...prev, tag]);
+    setMktTagInput("");
+    setShowSuggestions(false);
+  };
+
+  const updateBuy = (i, field, val) => setBuys(prev => prev.map((b, j) => j === i ? { ...b, [field]: val } : b));
+  const updateSell = (i, field, val) => setSells(prev => prev.map((s, j) => j === i ? { ...s, [field]: val } : s));
+
+  const handleSubmit = () => {
+    if (!ticker.trim()) { setFormError("請輸入股票代碼"); return; }
+    const validBuys = buys.filter(b => b.price && b.quantity);
+    if (validBuys.length === 0) { setFormError("請至少輸入一筆買進紀錄"); return; }
+    setFormError(null);
+
+    const tradeBuys = validBuys.map(b => ({
+      tradeId: genId(), date: b.date, time: "00:00:00",
+      price: parseFloat(b.price), quantity: parseFloat(b.quantity),
+      amount: parseFloat(b.price) * parseFloat(b.quantity),
+      commission: 0, exchange: "MANUAL",
+    }));
+    const validSells = sells.filter(s => s.price && s.quantity);
+    // Build FIFO for sells
+    const fifoLots = tradeBuys.map(b => ({ price: b.price, qty: b.quantity }));
+    const tradeSells = validSells.map(s => {
+      const qty = parseFloat(s.quantity);
+      const price = parseFloat(s.price);
+      let remaining = qty, costBasis = 0;
+      while (remaining > 0 && fifoLots.length > 0) {
+        const lot = fifoLots[0];
+        const consumed = Math.min(remaining, lot.qty);
+        costBasis += consumed * lot.price;
+        lot.qty -= consumed;
+        remaining -= consumed;
+        if (lot.qty <= 0) fifoLots.shift();
+      }
+      const grossPnl = qty * price - costBasis;
+      const pnlPctVal = costBasis > 0 ? (grossPnl / costBasis) * 100 : 0;
+      return {
+        tradeId: genId(), date: s.date, time: "00:00:00",
+        price, quantity: qty, amount: qty * price,
+        commission: 0, exchange: "MANUAL",
+        pnl: Math.round(grossPnl * 100) / 100,
+        pnlPct: Math.round(pnlPctVal * 100) / 100,
+      };
+    });
+
+    const trade = {
+      id: genId(), ticker: ticker.trim().toUpperCase(), name: name.trim() || ticker.trim().toUpperCase(),
+      currency, buys: tradeBuys, sells: tradeSells,
+      images: [], notes, patternId, marketTags, tags: extractTags(notes),
+    };
+    onSave(finalizeTrade(trade));
+  };
+
+  return (
+    <div>
+      <div style={S.h1}>手動新增交易</div>
+      <div style={S.sub}>手動輸入買賣紀錄</div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+        <div>
+          <div style={S.card}>
+            <div style={S.h3}>基本資訊</div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 100px", gap: 10, marginBottom: 12 }}>
+              <div><label style={S.label}>股票代碼 *</label><input style={S.input} value={ticker} onChange={e => setTicker(e.target.value)} placeholder="如 AAPL" /></div>
+              <div><label style={S.label}>公司名</label><input style={S.input} value={name} onChange={e => setName(e.target.value)} placeholder="選填" /></div>
+              <div><label style={S.label}>幣別</label><select style={S.select} value={currency} onChange={e => setCurrency(e.target.value)}>
+                <option value="USD">USD</option><option value="TWD">TWD</option><option value="EUR">EUR</option>
+              </select></div>
+            </div>
+            <div style={{ marginBottom: 10 }}>
+              <label style={S.label}>型態分類</label>
+              <select style={S.select} value={patternId} onChange={e => setPatternId(e.target.value)}>
+                <option value="">未分類</option>
+                {patternOptions.map(o => <option key={o.id} value={o.id}>{o.label}</option>)}
+              </select>
+            </div>
+            <div ref={sugRef}>
+              <label style={S.label}>市場標籤</label>
+              <div style={{ ...S.flexGap(6), position: "relative" }}>
+                <input style={{ ...S.input, flex: 1 }} value={mktTagInput}
+                  onChange={e => { setMktTagInput(e.target.value); setShowSuggestions(true); }}
+                  onFocus={() => setShowSuggestions(true)}
+                  placeholder="輸入標籤..."
+                  onKeyDown={e => { if (e.key === "Enter") { e.preventDefault(); addMktTag(); } }} />
+                <button style={S.btn()} onClick={() => addMktTag()}>加入</button>
+                {showSuggestions && mktSuggestions.length > 0 && (
+                  <div style={{ position: "absolute", top: "100%", left: 0, right: 70, marginTop: 2, background: "#FFF", border: "1px solid #E2E8F0", borderRadius: 7, boxShadow: "0 4px 16px rgba(0,0,0,0.08)", zIndex: 10, maxHeight: 120, overflowY: "auto" }}>
+                    {mktSuggestions.map(t => (
+                      <div key={t} style={{ padding: "6px 12px", cursor: "pointer", fontSize: 12.5 }}
+                        onMouseDown={e => { e.preventDefault(); addMktTag(t); }}
+                        onMouseEnter={e => e.currentTarget.style.background = "#F8FAFC"}
+                        onMouseLeave={e => e.currentTarget.style.background = "transparent"}>📌 {t}</div>
+                    ))}
+                  </div>
+                )}
+              </div>
+              {marketTags.length > 0 && <div style={{ marginTop: 6 }}>{marketTags.map(t => <span key={t} style={{ ...S.tag("#FEF3C7", "#92400E"), cursor: "pointer" }} onClick={() => setMarketTags(prev => prev.filter(x => x !== t))}>📌 {t} ✕</span>)}</div>}
+            </div>
+          </div>
+          <div style={S.card}>
+            <div style={S.h3}>交易心得</div>
+            <textarea style={{ ...S.textarea, minHeight: 80 }} value={notes} onChange={e => setNotes(e.target.value)} placeholder="使用 #標籤..." />
+          </div>
+        </div>
+
+        <div>
+          {/* Buy records */}
+          <div style={S.card}>
+            <div style={{ ...S.flexBetween, marginBottom: 8 }}>
+              <div style={S.h3}>買進紀錄</div>
+              <button style={{ ...S.btnOutline, padding: "3px 10px", fontSize: 11 }} onClick={() => setBuys(prev => [...prev, { date: new Date().toISOString().slice(0, 10), price: "", quantity: "" }])}>+ 加一筆</button>
+            </div>
+            {buys.map((b, i) => (
+              <div key={i} style={{ display: "grid", gridTemplateColumns: "1fr 90px 80px 30px", gap: 6, marginBottom: 6, alignItems: "end" }}>
+                <div><label style={S.label}>日期</label><input type="date" style={S.input} value={b.date} onChange={e => updateBuy(i, "date", e.target.value)} /></div>
+                <div><label style={S.label}>價格</label><input type="number" step="0.01" style={S.input} value={b.price} onChange={e => updateBuy(i, "price", e.target.value)} /></div>
+                <div><label style={S.label}>股數</label><input type="number" style={S.input} value={b.quantity} onChange={e => updateBuy(i, "quantity", e.target.value)} /></div>
+                {buys.length > 1 && <button style={{ ...S.btnOutline, padding: "4px", fontSize: 11, color: "#EF4444", borderColor: "#FECACA" }} onClick={() => setBuys(prev => prev.filter((_, j) => j !== i))}>✕</button>}
+              </div>
+            ))}
+          </div>
+
+          {/* Sell records */}
+          <div style={S.card}>
+            <div style={{ ...S.flexBetween, marginBottom: 8 }}>
+              <div style={S.h3}>賣出紀錄（選填）</div>
+              <button style={{ ...S.btnOutline, padding: "3px 10px", fontSize: 11 }} onClick={() => setSells(prev => [...prev, { date: new Date().toISOString().slice(0, 10), price: "", quantity: "" }])}>+ 加一筆</button>
+            </div>
+            {sells.length === 0 && <div style={{ fontSize: 11, color: "#CBD5E1" }}>尚未賣出（未平倉部位）</div>}
+            {sells.map((s, i) => (
+              <div key={i} style={{ display: "grid", gridTemplateColumns: "1fr 90px 80px 30px", gap: 6, marginBottom: 6, alignItems: "end" }}>
+                <div><label style={S.label}>日期</label><input type="date" style={S.input} value={s.date} onChange={e => updateSell(i, "date", e.target.value)} /></div>
+                <div><label style={S.label}>價格</label><input type="number" step="0.01" style={S.input} value={s.price} onChange={e => updateSell(i, "price", e.target.value)} /></div>
+                <div><label style={S.label}>股數</label><input type="number" style={S.input} value={s.quantity} onChange={e => updateSell(i, "quantity", e.target.value)} /></div>
+                <button style={{ ...S.btnOutline, padding: "4px", fontSize: 11, color: "#EF4444", borderColor: "#FECACA" }} onClick={() => setSells(prev => prev.filter((_, j) => j !== i))}>✕</button>
+              </div>
+            ))}
+          </div>
+
+          {formError && <div style={{ color: "#DC2626", fontSize: 13, fontWeight: 600, marginBottom: 8 }}>⚠ {formError}</div>}
+          <div style={{ ...S.flexGap(8), justifyContent: "flex-end" }}>
+            <button style={S.btnOutline} onClick={onCancel}>取消</button>
+            <button style={S.btn()} onClick={handleSubmit}>儲存交易</button>
           </div>
         </div>
       </div>
