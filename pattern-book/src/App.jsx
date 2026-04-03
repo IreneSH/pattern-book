@@ -3124,7 +3124,7 @@ function TradeDetailView({ tradeId, tradeStore, loadTradeFn, setTradeStore, trad
           </div>
           <div style={S.flexGap(6)}>
             <button style={S.btnOutline} onClick={() => setEditing(!editing)}><Icon name="edit" size={13} /> {editing ? "取消" : "編輯"}</button>
-            <button style={{ ...S.btnOutline, color: "#EF4444", borderColor: "#FECACA" }} onClick={onDelete}><Icon name="trash" size={13} /></button>
+            <button style={{ ...S.btnOutline, color: "#EF4444", borderColor: "#FECACA" }} onClick={() => onDelete(trade.id)}><Icon name="trash" size={13} /></button>
           </div>
         </div>
         <div style={{ marginTop: 8, ...S.flexGap(6), flexWrap: "wrap" }}>
