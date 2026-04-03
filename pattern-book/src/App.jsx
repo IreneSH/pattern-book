@@ -122,79 +122,120 @@ function buildTradesFromTxns(txns) {
     // Sort by date + time
     tickerTxns.sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time));
 
-    let currentTrade = null;
-    let fifoLots = []; // { price, qty, date, commission }
+    // Determine if this is a long or short trade by checking first transaction
+    const hasBuys = tickerTxns.some(t => t.action === "BUYTOOPEN");
+    const firstTxn = tickerTxns[0];
+    const isShort = !hasBuys || (firstTxn.action === "SELLTOCLOSE" && !hasBuys);
 
-    tickerTxns.forEach(txn => {
-      if (txn.action === "BUYTOOPEN") {
-        if (!currentTrade) {
-          currentTrade = {
-            id: genId(),
-            ticker,
-            name: txn.name,
-            currency: txn.currency,
-            buys: [],
-            sells: [],
-            images: [],
-            notes: "",
-            patternId: "",
-            marketTags: [],
-            tags: [],
-          };
+    if (isShort) {
+      // SHORT trade: sells open the position, buys close it
+      let currentTrade = null;
+      let fifoLots = []; // short lots: { price, qty, date }
+
+      tickerTxns.forEach(txn => {
+        if (txn.action === "SELLTOCLOSE" || txn.action === "SELLTOOPEN") {
+          // Opening short
+          if (!currentTrade) {
+            currentTrade = {
+              id: genId(), ticker, name: txn.name, currency: txn.currency,
+              type: "short", buys: [], sells: [],
+              images: [], notes: "", patternId: "", marketTags: [], tags: [],
+            };
+          }
+          currentTrade.sells.push({
+            tradeId: txn.tradeId, date: fmtTlgDate(txn.date), time: txn.time,
+            price: txn.price, quantity: txn.quantity, amount: Math.abs(txn.amount),
+            commission: txn.commission, exchange: txn.exchange,
+          });
+          fifoLots.push({ price: txn.price, qty: txn.quantity, date: fmtTlgDate(txn.date) });
+        } else if ((txn.action === "BUYTOOPEN" || txn.action === "BUYTOCLOSE") && currentTrade) {
+          // Covering short
+          let remaining = txn.quantity;
+          let sellBasis = 0;
+          while (remaining > 0 && fifoLots.length > 0) {
+            const lot = fifoLots[0];
+            const consumed = Math.min(remaining, lot.qty);
+            sellBasis += consumed * lot.price;
+            lot.qty -= consumed;
+            remaining -= consumed;
+            if (lot.qty <= 0) fifoLots.shift();
+          }
+          const buyCost = txn.quantity * txn.price;
+          const grossPnl = sellBasis - buyCost; // short P&L: sell high - buy low
+          const pnlPctVal = buyCost > 0 ? (grossPnl / buyCost) * 100 : 0;
+
+          currentTrade.buys.push({
+            tradeId: txn.tradeId, date: fmtTlgDate(txn.date), time: txn.time,
+            price: txn.price, quantity: txn.quantity, amount: Math.abs(txn.amount),
+            commission: txn.commission, exchange: txn.exchange,
+            pnl: Math.round(grossPnl * 100) / 100,
+            pnlPct: Math.round(pnlPctVal * 100) / 100,
+          });
+
+          const totalSold = currentTrade.sells.reduce((s, s2) => s + s2.quantity, 0);
+          const totalBought = currentTrade.buys.reduce((s, b) => s + b.quantity, 0);
+          if (totalBought >= totalSold) {
+            trades.push(finalizeTrade(currentTrade));
+            currentTrade = null;
+            fifoLots = [];
+          }
         }
-        currentTrade.buys.push({
-          tradeId: txn.tradeId,
-          date: fmtTlgDate(txn.date),
-          time: txn.time,
-          price: txn.price,
-          quantity: txn.quantity,
-          amount: Math.abs(txn.amount),
-          commission: txn.commission,
-          exchange: txn.exchange,
-        });
-        fifoLots.push({ price: txn.price, qty: txn.quantity, date: fmtTlgDate(txn.date), commission: txn.commission });
-      } else if (txn.action === "SELLTOCLOSE" && currentTrade) {
-        let remaining = txn.quantity;
-        let costBasis = 0;
-        while (remaining > 0 && fifoLots.length > 0) {
-          const lot = fifoLots[0];
-          const consumed = Math.min(remaining, lot.qty);
-          costBasis += consumed * lot.price;
-          lot.qty -= consumed;
-          remaining -= consumed;
-          if (lot.qty <= 0) fifoLots.shift();
+      });
+      if (currentTrade) trades.push(finalizeTrade(currentTrade));
+
+    } else {
+      // LONG trade: buys open the position, sells close it
+      let currentTrade = null;
+      let fifoLots = [];
+
+      tickerTxns.forEach(txn => {
+        if (txn.action === "BUYTOOPEN") {
+          if (!currentTrade) {
+            currentTrade = {
+              id: genId(), ticker, name: txn.name, currency: txn.currency,
+              type: "long", buys: [], sells: [],
+              images: [], notes: "", patternId: "", marketTags: [], tags: [],
+            };
+          }
+          currentTrade.buys.push({
+            tradeId: txn.tradeId, date: fmtTlgDate(txn.date), time: txn.time,
+            price: txn.price, quantity: txn.quantity, amount: Math.abs(txn.amount),
+            commission: txn.commission, exchange: txn.exchange,
+          });
+          fifoLots.push({ price: txn.price, qty: txn.quantity, date: fmtTlgDate(txn.date), commission: txn.commission });
+        } else if (txn.action === "SELLTOCLOSE" && currentTrade) {
+          let remaining = txn.quantity;
+          let costBasis = 0;
+          while (remaining > 0 && fifoLots.length > 0) {
+            const lot = fifoLots[0];
+            const consumed = Math.min(remaining, lot.qty);
+            costBasis += consumed * lot.price;
+            lot.qty -= consumed;
+            remaining -= consumed;
+            if (lot.qty <= 0) fifoLots.shift();
+          }
+          const sellProceeds = txn.quantity * txn.price;
+          const grossPnl = sellProceeds - costBasis;
+          const pnlPctVal = costBasis > 0 ? (grossPnl / costBasis) * 100 : 0;
+
+          currentTrade.sells.push({
+            tradeId: txn.tradeId, date: fmtTlgDate(txn.date), time: txn.time,
+            price: txn.price, quantity: txn.quantity, amount: Math.abs(txn.amount),
+            commission: txn.commission, exchange: txn.exchange,
+            pnl: Math.round(grossPnl * 100) / 100,
+            pnlPct: Math.round(pnlPctVal * 100) / 100,
+          });
+
+          const totalBought = currentTrade.buys.reduce((s, b) => s + b.quantity, 0);
+          const totalSold = currentTrade.sells.reduce((s, s2) => s + s2.quantity, 0);
+          if (totalSold >= totalBought) {
+            trades.push(finalizeTrade(currentTrade));
+            currentTrade = null;
+            fifoLots = [];
+          }
         }
-        const sellProceeds = txn.quantity * txn.price;
-        const grossPnl = sellProceeds - costBasis;
-        const pnlPctVal = costBasis > 0 ? (grossPnl / costBasis) * 100 : 0;
-
-        currentTrade.sells.push({
-          tradeId: txn.tradeId,
-          date: fmtTlgDate(txn.date),
-          time: txn.time,
-          price: txn.price,
-          quantity: txn.quantity,
-          amount: Math.abs(txn.amount),
-          commission: txn.commission,
-          exchange: txn.exchange,
-          pnl: Math.round(grossPnl * 100) / 100,
-          pnlPct: Math.round(pnlPctVal * 100) / 100,
-        });
-
-        // Check if position is fully closed
-        const totalBought = currentTrade.buys.reduce((s, b) => s + b.quantity, 0);
-        const totalSold = currentTrade.sells.reduce((s, s2) => s + s2.quantity, 0);
-        if (totalSold >= totalBought) {
-          trades.push(finalizeTrade(currentTrade));
-          currentTrade = null;
-          fifoLots = [];
-        }
-      }
-    });
-
-    // If there's an open position remaining
-    if (currentTrade) {
-      trades.push(finalizeTrade(currentTrade));
+      });
+      if (currentTrade) trades.push(finalizeTrade(currentTrade));
     }
   });
 
@@ -202,22 +243,44 @@ function buildTradesFromTxns(txns) {
 }
 
 function finalizeTrade(trade) {
+  const isShort = trade.type === "short";
   const totalBuyQty = trade.buys.reduce((s, b) => s + b.quantity, 0);
   const totalSellQty = trade.sells.reduce((s, s2) => s + s2.quantity, 0);
   const totalBuyCost = trade.buys.reduce((s, b) => s + b.amount, 0);
   const totalSellProceeds = trade.sells.reduce((s, s2) => s + s2.amount, 0);
-  const totalBuyComm = trade.buys.reduce((s, b) => s + b.commission, 0);
-  const totalSellComm = trade.sells.reduce((s, s2) => s + s2.commission, 0);
+  const totalBuyComm = trade.buys.reduce((s, b) => s + (b.commission || 0), 0);
+  const totalSellComm = trade.sells.reduce((s, s2) => s + (s2.commission || 0), 0);
   const totalCommission = totalBuyComm + totalSellComm;
-  const status = totalSellQty >= totalBuyQty ? "closed" : "open";
-  const remainingQty = totalBuyQty - totalSellQty;
-  const avgBuyPrice = totalBuyQty > 0 ? totalBuyCost / totalBuyQty : 0;
-  const grossPnl = trade.sells.reduce((s, s2) => s + s2.pnl, 0);
-  const pnl = grossPnl - totalCommission;
-  const pnlPct = totalBuyCost > 0 ? (pnl / totalBuyCost) * 100 : 0;
 
-  const openDate = trade.buys.length > 0 ? trade.buys[0].date : "";
-  const closeDate = status === "closed" && trade.sells.length > 0 ? trade.sells[trade.sells.length - 1].date : "";
+  let status, remainingQty;
+  if (isShort) {
+    status = totalBuyQty >= totalSellQty ? "closed" : "open";
+    remainingQty = totalSellQty - totalBuyQty;
+  } else {
+    status = totalSellQty >= totalBuyQty ? "closed" : "open";
+    remainingQty = totalBuyQty - totalSellQty;
+  }
+
+  const avgBuyPrice = totalBuyQty > 0 ? totalBuyCost / totalBuyQty : 0;
+  const avgSellPrice = totalSellQty > 0 ? totalSellProceeds / totalSellQty : 0;
+
+  // P&L: for long, the per-sell pnl is already computed; for short, per-buy pnl is computed
+  let grossPnl;
+  if (isShort) {
+    grossPnl = trade.buys.reduce((s, b) => s + (b.pnl || 0), 0);
+  } else {
+    grossPnl = trade.sells.reduce((s, s2) => s + (s2.pnl || 0), 0);
+  }
+  const pnl = grossPnl - totalCommission;
+
+  // P&L % base: for long use totalBuyCost, for short use totalSellProceeds (capital at risk)
+  const capitalBase = isShort ? totalSellProceeds : totalBuyCost;
+  const pnlPct = capitalBase > 0 ? (pnl / capitalBase) * 100 : 0;
+
+  // Dates
+  const allDates = [...trade.buys.map(b => b.date), ...trade.sells.map(s => s.date)].sort();
+  const openDate = allDates[0] || "";
+  const closeDate = status === "closed" ? allDates[allDates.length - 1] || "" : "";
   let holdingDays = 0;
   if (openDate && closeDate) {
     holdingDays = Math.round((new Date(closeDate) - new Date(openDate)) / (1000 * 60 * 60 * 24));
@@ -227,19 +290,16 @@ function finalizeTrade(trade) {
 
   return {
     ...trade,
-    status,
-    totalBuyQty,
-    totalSellQty,
-    remainingQty,
+    status, remainingQty,
+    totalBuyQty, totalSellQty,
     avgBuyPrice: Math.round(avgBuyPrice * 100) / 100,
+    avgSellPrice: Math.round(avgSellPrice * 100) / 100,
     totalBuyCost: Math.round(totalBuyCost * 100) / 100,
     totalSellProceeds: Math.round(totalSellProceeds * 100) / 100,
     totalCommission: Math.round(totalCommission * 100) / 100,
     pnl: Math.round(pnl * 100) / 100,
     pnlPct: Math.round(pnlPct * 100) / 100,
-    holdingDays,
-    openDate,
-    closeDate,
+    holdingDays, openDate, closeDate,
   };
 }
 
@@ -596,30 +656,31 @@ function StockDatabook({ userId }) {
   const saveTradeFn = (t) => {
     const indexEntry = {
       id: t.id, ticker: t.ticker, name: t.name, currency: t.currency, status: t.status,
+      type: t.type || "long",
       pnl: t.pnl, pnlPct: t.pnlPct, holdingDays: t.holdingDays,
       openDate: t.openDate, closeDate: t.closeDate,
       avgBuyPrice: t.avgBuyPrice, totalBuyCost: t.totalBuyCost,
+      avgSellPrice: t.avgSellPrice, totalSellProceeds: t.totalSellProceeds,
       remainingQty: t.remainingQty, totalBuyQty: t.totalBuyQty, totalSellQty: t.totalSellQty,
       patternId: t.patternId || "", marketTags: t.marketTags || [], tags: t.tags || [],
     };
-    let nextIdx;
-    if (tradesIndex.find(x => x.id === t.id)) {
-      nextIdx = tradesIndex.map(x => x.id === t.id ? indexEntry : x);
-    } else {
-      nextIdx = [...tradesIndex, indexEntry];
-    }
-    setTradesIndex(nextIdx);
+    setTradesIndex(prev => {
+      const next = prev.find(x => x.id === t.id) ? prev.map(x => x.id === t.id ? indexEntry : x) : [...prev, indexEntry];
+      fsSaveTradesIndex(userId, next);
+      return next;
+    });
     setTradeStore(prev => ({ ...prev, [t.id]: t }));
-    fsSaveTradesIndex(userId, nextIdx);
     fsSaveTrade(userId, t);
   };
 
   const deleteTradeFn = (id) => {
     if (!confirm("確定刪除這筆交易？")) return;
-    const nextIdx = tradesIndex.filter(x => x.id !== id);
-    setTradesIndex(nextIdx);
+    setTradesIndex(prev => {
+      const next = prev.filter(x => x.id !== id);
+      fsSaveTradesIndex(userId, next);
+      return next;
+    });
     setTradeStore(prev => { const n = { ...prev }; delete n[id]; return n; });
-    fsSaveTradesIndex(userId, nextIdx);
     fsDeleteTrade(userId, id);
     if (selectedTrade?.id === id) setSelectedTrade(null);
     showToast("已刪除交易");
@@ -658,17 +719,43 @@ function StockDatabook({ userId }) {
       }
     });
 
-    let imported = 0;
+    const toImport = [];
     newTrades.forEach(trade => {
       const allTxnIds = [...trade.buys.map(b => b.tradeId), ...trade.sells.map(s => s.tradeId)];
       const hasExisting = allTxnIds.some(id => existingTradeIds.has(id));
       if (!hasExisting) {
-        saveTradeFn(trade);
+        toImport.push(trade);
         allTxnIds.forEach(id => existingTradeIds.add(id));
-        imported++;
       }
     });
-    return imported;
+
+    if (toImport.length === 0) return 0;
+
+    // Batch update state
+    const newIndexEntries = toImport.map(t => ({
+      id: t.id, ticker: t.ticker, name: t.name, currency: t.currency, status: t.status,
+      type: t.type || "long",
+      pnl: t.pnl, pnlPct: t.pnlPct, holdingDays: t.holdingDays,
+      openDate: t.openDate, closeDate: t.closeDate,
+      avgBuyPrice: t.avgBuyPrice, totalBuyCost: t.totalBuyCost,
+      avgSellPrice: t.avgSellPrice, totalSellProceeds: t.totalSellProceeds,
+      remainingQty: t.remainingQty, totalBuyQty: t.totalBuyQty, totalSellQty: t.totalSellQty,
+      patternId: t.patternId || "", marketTags: t.marketTags || [], tags: t.tags || [],
+    }));
+
+    setTradesIndex(prev => {
+      const next = [...prev, ...newIndexEntries];
+      fsSaveTradesIndex(userId, next);
+      return next;
+    });
+    setTradeStore(prev => {
+      const next = { ...prev };
+      toImport.forEach(t => { next[t.id] = t; });
+      return next;
+    });
+    toImport.forEach(t => fsSaveTrade(userId, t));
+
+    return toImport.length;
   };
 
   const getPattern = (id) => patterns.find(p => p.id === id);
@@ -2664,7 +2751,7 @@ function TradesView({ tradesIndex, tradeStore, loadTrade, patterns, topPatterns,
       )}
 
       {/* Equity curve */}
-      {equityCurve.length > 1 && (
+      {equityCurve.length >= 1 && (
         <div style={S.card}>
           <div style={S.h3}>報酬曲線</div>
           <EquityCurveChart data={equityCurve} />
@@ -2746,60 +2833,52 @@ function TradesView({ tradesIndex, tradeStore, loadTrade, patterns, topPatterns,
 
 /* ── Equity Curve SVG Chart ── */
 function EquityCurveChart({ data }) {
-  if (!data || data.length < 2) return null;
-  const W = 800, H = 200, PL = 60, PR = 60, PT = 20, PB = 40;
+  if (!data || data.length === 0) return null;
+  const W = 700, H = 180, PL = 55, PR = 50, PT = 15, PB = 28;
   const cw = W - PL - PR, ch = H - PT - PB;
-  const pnls = data.map(d => d.pnl);
-  const pcts = data.map(d => d.pct);
+
+  // For single point, add a zero-origin point
+  const chartData = data.length === 1 ? [{ date: data[0].date, pnl: 0, pct: 0 }, ...data] : data;
+
+  const pnls = chartData.map(d => d.pnl);
+  const pcts = chartData.map(d => d.pct);
   const minPnl = Math.min(0, ...pnls), maxPnl = Math.max(0, ...pnls);
   const rangePnl = maxPnl - minPnl || 1;
   const minPct = Math.min(0, ...pcts), maxPct = Math.max(0, ...pcts);
   const rangePct = maxPct - minPct || 1;
 
-  const xStep = cw / (data.length - 1);
+  const xStep = chartData.length > 1 ? cw / (chartData.length - 1) : cw;
   const yPnl = (v) => PT + ch - ((v - minPnl) / rangePnl) * ch;
-  const yPct = (v) => PT + ch - ((v - minPct) / rangePct) * ch;
 
-  const linePath = data.map((d, i) => `${i === 0 ? "M" : "L"}${PL + i * xStep},${yPnl(d.pnl)}`).join(" ");
-  const areaPath = linePath + ` L${PL + (data.length - 1) * xStep},${yPnl(0)} L${PL},${yPnl(0)} Z`;
+  const linePath = chartData.map((d, i) => `${i === 0 ? "M" : "L"}${PL + i * xStep},${yPnl(d.pnl)}`).join(" ");
+  const areaPath = linePath + ` L${PL + (chartData.length - 1) * xStep},${yPnl(0)} L${PL},${yPnl(0)} Z`;
 
-  // Y-axis ticks (left: $, right: %)
   const pnlTicks = 5;
-  const pctTicks = 5;
-
-  // X-axis labels (show ~6 dates)
-  const labelInterval = Math.max(1, Math.floor(data.length / 6));
+  const labelInterval = Math.max(1, Math.floor(chartData.length / 6));
 
   return (
     <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "auto" }}>
-      {/* Grid lines */}
       {Array.from({ length: pnlTicks + 1 }, (_, i) => {
         const y = PT + (ch / pnlTicks) * i;
         return <line key={i} x1={PL} x2={W - PR} y1={y} y2={y} stroke="#F1F5F9" strokeWidth="1" />;
       })}
-      {/* Zero line */}
       {minPnl < 0 && <line x1={PL} x2={W - PR} y1={yPnl(0)} y2={yPnl(0)} stroke="#CBD5E1" strokeWidth="1" strokeDasharray="4,4" />}
-      {/* Area */}
       <path d={areaPath} fill="#4F46E520" />
-      {/* Line */}
       <path d={linePath} fill="none" stroke="#4F46E5" strokeWidth="2" />
-      {/* Left Y-axis labels ($) */}
       {Array.from({ length: pnlTicks + 1 }, (_, i) => {
         const val = maxPnl - (rangePnl / pnlTicks) * i;
-        return <text key={`l${i}`} x={PL - 6} y={PT + (ch / pnlTicks) * i + 4} textAnchor="end" fontSize="10" fill="#94A3B8">${Math.round(val).toLocaleString()}</text>;
+        return <text key={`l${i}`} x={PL - 5} y={PT + (ch / pnlTicks) * i + 3} textAnchor="end" fontSize="9" fill="#94A3B8">${Math.round(val).toLocaleString()}</text>;
       })}
-      {/* Right Y-axis labels (%) */}
-      {Array.from({ length: pctTicks + 1 }, (_, i) => {
-        const val = maxPct - (rangePct / pctTicks) * i;
-        return <text key={`r${i}`} x={W - PR + 6} y={PT + (ch / pctTicks) * i + 4} textAnchor="start" fontSize="10" fill="#94A3B8">{val.toFixed(1)}%</text>;
+      {Array.from({ length: pnlTicks + 1 }, (_, i) => {
+        const val = maxPct - (rangePct / pnlTicks) * i;
+        return <text key={`r${i}`} x={W - PR + 5} y={PT + (ch / pnlTicks) * i + 3} textAnchor="start" fontSize="9" fill="#94A3B8">{val.toFixed(1)}%</text>;
       })}
-      {/* X-axis labels */}
-      {data.map((d, i) => {
-        if (i % labelInterval !== 0 && i !== data.length - 1) return null;
-        return <text key={i} x={PL + i * xStep} y={H - 8} textAnchor="middle" fontSize="10" fill="#94A3B8">{d.date.slice(5)}</text>;
+      {chartData.map((d, i) => {
+        if (i % labelInterval !== 0 && i !== chartData.length - 1) return null;
+        return <text key={i} x={PL + i * xStep} y={H - 6} textAnchor="middle" fontSize="9" fill="#94A3B8">{d.date.slice(5)}</text>;
       })}
-      <text x={6} y={PT + ch / 2} textAnchor="middle" fontSize="10" fill="#94A3B8" transform={`rotate(-90,6,${PT + ch / 2})`}>金額 ($)</text>
-      <text x={W - 6} y={PT + ch / 2} textAnchor="middle" fontSize="10" fill="#94A3B8" transform={`rotate(90,${W - 6},${PT + ch / 2})`}>報酬率 (%)</text>
+      <text x={12} y={PT + ch / 2} textAnchor="middle" fontSize="9" fill="#94A3B8" transform={`rotate(-90,12,${PT + ch / 2})`}>金額 ($)</text>
+      <text x={W - 8} y={PT + ch / 2} textAnchor="middle" fontSize="9" fill="#94A3B8" transform={`rotate(90,${W - 8},${PT + ch / 2})`}>報酬率 (%)</text>
     </svg>
   );
 }
@@ -2815,6 +2894,8 @@ function TradeDetailView({ trade, tradeStore, patterns, topPatterns, getChildren
   const [images, setImages] = useState(trade?.images || []);
   const [mktTagInput, setMktTagInput] = useState("");
   const [showSuggestions, setShowSuggestions] = useState(false);
+  const [newBuy, setNewBuy] = useState(null); // { date, price, quantity }
+  const [newSell, setNewSell] = useState(null);
   const fileRef = useRef();
   const sugRef = useRef();
 
@@ -2853,7 +2934,42 @@ function TradeDetailView({ trade, tradeStore, patterns, topPatterns, getChildren
 
   const handleSave = () => {
     const tags = extractTags(notes);
-    onSave({ ...trade, notes, patternId, marketTags, images, tags });
+    let updatedTrade = { ...trade, notes, patternId, marketTags, images, tags };
+    // Add new manual buy if filled
+    if (newBuy && newBuy.price && newBuy.quantity) {
+      const qty = parseFloat(newBuy.quantity);
+      const price = parseFloat(newBuy.price);
+      updatedTrade.buys = [...updatedTrade.buys, {
+        tradeId: genId(), date: newBuy.date, time: "00:00:00",
+        price, quantity: qty, amount: qty * price, commission: 0, exchange: "MANUAL",
+      }];
+      setNewBuy(null);
+    }
+    // Add new manual sell if filled
+    if (newSell && newSell.price && newSell.quantity) {
+      const qty = parseFloat(newSell.quantity);
+      const price = parseFloat(newSell.price);
+      // FIFO P&L calc for new sell
+      const isShort = updatedTrade.type === "short";
+      let pnlVal = 0, pnlPctVal = 0;
+      if (!isShort) {
+        const fifoLots = updatedTrade.buys.map(b => ({ price: b.price, qty: b.quantity }));
+        const soldBefore = updatedTrade.sells.reduce((s, s2) => s + s2.quantity, 0);
+        let skip = soldBefore;
+        for (const lot of fifoLots) { const c = Math.min(skip, lot.qty); lot.qty -= c; skip -= c; }
+        let rem = qty, cost = 0;
+        for (const lot of fifoLots) { if (rem <= 0) break; const c = Math.min(rem, lot.qty); cost += c * lot.price; lot.qty -= c; rem -= c; }
+        pnlVal = qty * price - cost;
+        pnlPctVal = cost > 0 ? (pnlVal / cost) * 100 : 0;
+      }
+      updatedTrade.sells = [...updatedTrade.sells, {
+        tradeId: genId(), date: newSell.date, time: "00:00:00",
+        price, quantity: qty, amount: qty * price, commission: 0, exchange: "MANUAL",
+        pnl: Math.round(pnlVal * 100) / 100, pnlPct: Math.round(pnlPctVal * 100) / 100,
+      }];
+      setNewSell(null);
+    }
+    onSave(finalizeTrade(updatedTrade));
     setEditing(false);
   };
 
@@ -2889,6 +3005,7 @@ function TradeDetailView({ trade, tradeStore, patterns, topPatterns, getChildren
             {pat && <Dot color={pat.color} size={12} />}
             <span style={{ fontWeight: 700, fontSize: 20 }}>{trade.ticker}</span>
             <span style={{ fontSize: 13, color: "#94A3B8" }}>{trade.name}</span>
+            {trade.type === "short" && <span style={S.tag("#FEE2E2", "#DC2626")}>Short</span>}
             <span style={{ ...S.badge(trade.status === "open" ? "pending" : trade.pnl >= 0 ? "success" : "failure") }}>
               {trade.status === "open" ? "未平倉" : "已平倉"}
             </span>
@@ -2931,7 +3048,10 @@ function TradeDetailView({ trade, tradeStore, patterns, topPatterns, getChildren
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
         {/* Buys */}
         <div style={S.card}>
-          <div style={S.h3}>買進紀錄 ({trade.buys.length} 筆)</div>
+          <div style={{ ...S.flexBetween, marginBottom: 6 }}>
+            <div style={S.h3}>買進紀錄 ({trade.buys.length} 筆)</div>
+            {editing && !newBuy && <button style={{ ...S.btnOutline, padding: "3px 10px", fontSize: 11 }} onClick={() => setNewBuy({ date: new Date().toISOString().slice(0, 10), price: "", quantity: "" })}>+ 手動加</button>}
+          </div>
           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
             <thead><tr style={{ borderBottom: "1px solid #E2E8F0" }}>
               <th style={{ textAlign: "left", padding: "6px 4px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>日期</th>
@@ -2950,11 +3070,22 @@ function TradeDetailView({ trade, tradeStore, patterns, topPatterns, getChildren
               ))}
             </tbody>
           </table>
+          {editing && newBuy && (
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 80px 60px 50px", gap: 4, marginTop: 8, alignItems: "end" }}>
+              <div><label style={S.label}>日期</label><input type="date" style={S.input} value={newBuy.date} onChange={e => setNewBuy(p => ({ ...p, date: e.target.value }))} /></div>
+              <div><label style={S.label}>價格</label><input type="number" step="0.01" style={S.input} value={newBuy.price} onChange={e => setNewBuy(p => ({ ...p, price: e.target.value }))} /></div>
+              <div><label style={S.label}>股數</label><input type="number" style={S.input} value={newBuy.quantity} onChange={e => setNewBuy(p => ({ ...p, quantity: e.target.value }))} /></div>
+              <button style={{ ...S.btnOutline, padding: "4px", fontSize: 11, color: "#EF4444" }} onClick={() => setNewBuy(null)}>✕</button>
+            </div>
+          )}
         </div>
 
         {/* Sells */}
         <div style={S.card}>
-          <div style={S.h3}>賣出紀錄 ({trade.sells.length} 筆)</div>
+          <div style={{ ...S.flexBetween, marginBottom: 6 }}>
+            <div style={S.h3}>賣出紀錄 ({trade.sells.length} 筆)</div>
+            {editing && !newSell && <button style={{ ...S.btnOutline, padding: "3px 10px", fontSize: 11 }} onClick={() => setNewSell({ date: new Date().toISOString().slice(0, 10), price: "", quantity: "" })}>+ 手動加</button>}
+          </div>
           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
             <thead><tr style={{ borderBottom: "1px solid #E2E8F0" }}>
               <th style={{ textAlign: "left", padding: "6px 4px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>日期</th>
@@ -2969,12 +3100,20 @@ function TradeDetailView({ trade, tradeStore, patterns, topPatterns, getChildren
                   <td style={{ padding: "6px 4px" }}>{s.date}</td>
                   <td style={{ padding: "6px 4px", textAlign: "right" }}>${s.price.toFixed(2)}</td>
                   <td style={{ padding: "6px 4px", textAlign: "right" }}>{s.quantity}</td>
-                  <td style={{ padding: "6px 4px", textAlign: "right", fontWeight: 600, color: s.pnl >= 0 ? "#059669" : "#DC2626" }}>{fmtMoney(s.pnl)}</td>
-                  <td style={{ padding: "6px 4px", textAlign: "right", fontWeight: 600, color: s.pnlPct >= 0 ? "#059669" : "#DC2626" }}>{(s.pnlPct >= 0 ? "+" : "") + s.pnlPct.toFixed(2)}%</td>
+                  <td style={{ padding: "6px 4px", textAlign: "right", fontWeight: 600, color: (s.pnl||0) >= 0 ? "#059669" : "#DC2626" }}>{fmtMoney(s.pnl||0)}</td>
+                  <td style={{ padding: "6px 4px", textAlign: "right", fontWeight: 600, color: (s.pnlPct||0) >= 0 ? "#059669" : "#DC2626" }}>{((s.pnlPct||0) >= 0 ? "+" : "") + (s.pnlPct||0).toFixed(2)}%</td>
                 </tr>
               ))}
             </tbody>
           </table>
+          {editing && newSell && (
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 80px 60px 50px", gap: 4, marginTop: 8, alignItems: "end" }}>
+              <div><label style={S.label}>日期</label><input type="date" style={S.input} value={newSell.date} onChange={e => setNewSell(p => ({ ...p, date: e.target.value }))} /></div>
+              <div><label style={S.label}>價格</label><input type="number" step="0.01" style={S.input} value={newSell.price} onChange={e => setNewSell(p => ({ ...p, price: e.target.value }))} /></div>
+              <div><label style={S.label}>股數</label><input type="number" style={S.input} value={newSell.quantity} onChange={e => setNewSell(p => ({ ...p, quantity: e.target.value }))} /></div>
+              <button style={{ ...S.btnOutline, padding: "4px", fontSize: 11, color: "#EF4444" }} onClick={() => setNewSell(null)}>✕</button>
+            </div>
+          )}
         </div>
       </div>
 
@@ -3172,15 +3311,74 @@ function TradeStatsView({ tradesIndex, tradeStore, loadTrade, patterns, topPatte
   const gainMags = wins.map(t => t.pnlPct).sort((a, b) => b - a);
   const lossMags = losses.map(t => Math.abs(t.pnlPct)).sort((a, b) => b - a);
 
-  const MiniBar = ({ values, color, maxVal }) => {
+  const MiniBar = ({ values, color }) => {
     if (values.length === 0) return <div style={{ color: "#CBD5E1", fontSize: 11 }}>無資料</div>;
-    const mx = maxVal || Math.max(...values);
-    const bw = Math.max(6, Math.min(20, 200 / values.length));
+    const mx = Math.max(...values);
+    const PL = 40, PR = 10, PT = 10, PB = 20;
+    const bw = Math.max(6, Math.min(20, 300 / values.length));
+    const totalW = PL + PR + values.length * (bw + 2);
+    const chartH = 80;
+    const H = chartH + PT + PB;
+    const ticks = 4;
     return (
-      <svg viewBox={`0 0 ${values.length * (bw + 2)} 100`} style={{ width: "100%", height: 80 }}>
+      <svg viewBox={`0 0 ${totalW} ${H}`} style={{ width: "100%", height: H }}>
+        {Array.from({ length: ticks + 1 }, (_, i) => {
+          const val = mx - (mx / ticks) * i;
+          const y = PT + (chartH / ticks) * i;
+          return <g key={i}>
+            <line x1={PL} x2={totalW - PR} y1={y} y2={y} stroke="#F1F5F9" strokeWidth="0.5" />
+            <text x={PL - 4} y={y + 3} textAnchor="end" fontSize="8" fill="#94A3B8">{val.toFixed(1)}%</text>
+          </g>;
+        })}
         {values.map((v, i) => {
-          const h = mx > 0 ? (v / mx) * 90 : 0;
-          return <rect key={i} x={i * (bw + 2)} y={100 - h} width={bw} height={h} fill={color} rx="1" />;
+          const h = mx > 0 ? (v / mx) * chartH : 0;
+          return <rect key={i} x={PL + i * (bw + 2)} y={PT + chartH - h} width={bw} height={h} fill={color} rx="1" />;
+        })}
+        {values.map((v, i) => {
+          if (values.length <= 10 || i % Math.ceil(values.length / 8) === 0)
+            return <text key={i} x={PL + i * (bw + 2) + bw / 2} y={H - 4} textAnchor="middle" fontSize="7" fill="#94A3B8">{i + 1}</text>;
+          return null;
+        })}
+      </svg>
+    );
+  };
+
+  // Axis-enabled bar chart for Gains/Losses and DRMA
+  const AxisBarChart = ({ data, getColor }) => {
+    if (data.length === 0) return <div style={{ color: "#CBD5E1", fontSize: 11 }}>無資料</div>;
+    const PL = 40, PR = 10, PT = 8, PB = 20;
+    const bw = Math.max(6, Math.min(20, 360 / data.length));
+    const totalW = PL + PR + data.length * (bw + 2);
+    const chartH = 90;
+    const H = chartH + PT + PB;
+    const maxAbs = Math.max(...data.map(Math.abs), 0.01);
+    const midY = PT + chartH / 2;
+    const ticks = 4;
+
+    return (
+      <svg viewBox={`0 0 ${totalW} ${H}`} style={{ width: "100%", height: H }}>
+        {/* Grid + Y labels */}
+        {Array.from({ length: ticks + 1 }, (_, i) => {
+          const ratio = i / ticks;
+          const val = maxAbs - ratio * maxAbs * 2;
+          const y = PT + ratio * chartH;
+          return <g key={i}>
+            <line x1={PL} x2={totalW - PR} y1={y} y2={y} stroke="#F1F5F9" strokeWidth="0.5" />
+            <text x={PL - 4} y={y + 3} textAnchor="end" fontSize="8" fill="#94A3B8">{val.toFixed(1)}%</text>
+          </g>;
+        })}
+        <line x1={PL} x2={totalW - PR} y1={midY} y2={midY} stroke="#CBD5E1" strokeWidth="0.8" />
+        {/* Bars */}
+        {data.map((v, i) => {
+          const h = maxAbs > 0 ? (Math.abs(v) / maxAbs) * (chartH / 2) : 0;
+          const y = v >= 0 ? midY - h : midY;
+          return <rect key={i} x={PL + i * (bw + 2)} y={y} width={bw} height={h} fill={getColor(v)} rx="1" />;
+        })}
+        {/* X labels */}
+        {data.map((v, i) => {
+          if (data.length <= 12 || i % Math.ceil(data.length / 8) === 0)
+            return <text key={i} x={PL + i * (bw + 2) + bw / 2} y={H - 4} textAnchor="middle" fontSize="7" fill="#94A3B8">{i + 1}</text>;
+          return null;
         })}
       </svg>
     );
@@ -3250,31 +3448,14 @@ function TradeStatsView({ tradesIndex, tradeStore, loadTrade, patterns, topPatte
             {/* Gains and Losses */}
             <div style={S.card}>
               <div style={S.h3}>Gains and Losses</div>
-              <svg viewBox={`0 0 ${barData.length * 18 + 20} 120`} style={{ width: "100%", height: 120 }}>
-                {barData.map((v, i) => {
-                  const maxAbs = Math.max(...barData.map(Math.abs));
-                  const h = maxAbs > 0 ? (Math.abs(v) / maxAbs) * 50 : 0;
-                  const y = v >= 0 ? 60 - h : 60;
-                  return <rect key={i} x={10 + i * 18} y={y} width={14} height={h} fill={v >= 0 ? "#34D399" : "#F87171"} rx="1" />;
-                })}
-                <line x1="0" x2={barData.length * 18 + 20} y1="60" y2="60" stroke="#CBD5E1" strokeWidth="0.5" />
-              </svg>
+              <AxisBarChart data={barData} getColor={v => v >= 0 ? "#34D399" : "#F87171"} />
             </div>
 
             {/* DRMA Curve */}
             <div style={S.card}>
               <div style={S.h3}>DRMA Curve</div>
-              {drmaData.length > 1 ? (
-                <svg viewBox={`0 0 ${drmaData.length * 18 + 20} 120`} style={{ width: "100%", height: 120 }}>
-                  {drmaData.map((v, i) => {
-                    const maxAbs = Math.max(...drmaData.map(Math.abs));
-                    const h = maxAbs > 0 ? (Math.abs(v) / maxAbs) * 50 : 0;
-                    const base = 60;
-                    const y = v >= 0 ? base - h : base;
-                    return <rect key={i} x={10 + i * 18} y={y} width={14} height={h} fill={v >= 0 ? "#4F46E5" : "#F87171"} rx="1" />;
-                  })}
-                  <line x1="0" x2={drmaData.length * 18 + 20} y1="60" y2="60" stroke="#CBD5E1" strokeWidth="0.5" />
-                </svg>
+              {drmaData.length >= 1 ? (
+                <AxisBarChart data={drmaData} getColor={v => v >= 0 ? "#4F46E5" : "#F87171"} />
               ) : <div style={{ color: "#CBD5E1", fontSize: 11 }}>資料不足</div>}
             </div>
 
