@@ -64,6 +64,12 @@ async function fsLoadTradesIndex(uid) {
 async function fsSaveTradesIndex(uid, idx) {
   try { await setDoc(doc(db, "users", uid, "data", "tradesIndex"), { items: idx }); } catch(e) { console.error("save trades index err", e); }
 }
+async function fsLoadCapitalHistory(uid) {
+  try { const snap = await getDoc(doc(db, "users", uid, "data", "capitalHistory")); return snap.exists() ? snap.data().items || [] : []; } catch(e) { console.error("load capital err", e); return []; }
+}
+async function fsSaveCapitalHistory(uid, items) {
+  try { await setDoc(doc(db, "users", uid, "data", "capitalHistory"), { items }); } catch(e) { console.error("save capital err", e); }
+}
 async function fsSaveTrade(uid, t) {
   try { await setDoc(doc(db, "users", uid, "trades", t.id), t); } catch(e) { console.error("save trade err", e); }
 }
@@ -303,6 +309,69 @@ function finalizeTrade(trade) {
   };
 }
 
+/* ── Capital & TWRR Helpers ── */
+function getCapitalAtDate(capitalHistory, closedTrades, date) {
+  // Capital = sum of deposits up to date + cumulative realized P&L up to date
+  let capital = 0;
+  (capitalHistory || []).forEach(d => {
+    if (d.date <= date) capital += (d.type === "deposit" ? d.amount : -d.amount);
+  });
+  closedTrades.forEach(t => {
+    if (t.closeDate && t.closeDate <= date) capital += t.pnl;
+  });
+  return capital;
+}
+
+function calcTWRR(closedTrades, capitalHistory) {
+  // Time-Weighted Rate of Return
+  // Build timeline of all cash flow events (deposits/withdrawals) and trade P&L events
+  if (!capitalHistory || capitalHistory.length === 0) return [];
+
+  const flows = [...(capitalHistory || [])].map(d => ({
+    date: d.date, flow: d.type === "deposit" ? d.amount : -d.amount, pnl: 0
+  }));
+
+  // Add each trade close as a P&L event
+  const sorted = [...closedTrades].sort((a, b) => a.closeDate.localeCompare(b.closeDate));
+  sorted.forEach(t => {
+    if (t.closeDate) flows.push({ date: t.closeDate, flow: 0, pnl: t.pnl });
+  });
+
+  flows.sort((a, b) => a.date.localeCompare(b.date));
+  if (flows.length === 0) return [];
+
+  // Build sub-periods at each deposit/withdrawal
+  let nav = 0; // net asset value
+  const results = [];
+  let twrrProduct = 1;
+
+  for (const ev of flows) {
+    const prevNav = nav;
+    if (ev.flow !== 0) {
+      // Cash flow: end current sub-period, start new one
+      if (prevNav > 0 && results.length > 0) {
+        // Sub-period return before the cash flow
+        const subReturn = nav / prevNav;
+        twrrProduct *= subReturn;
+      }
+      nav += ev.flow;
+    }
+    if (ev.pnl !== 0) {
+      nav += ev.pnl;
+    }
+    results.push({
+      date: ev.date,
+      nav: Math.round(nav * 100) / 100,
+      twrr: Math.round((twrrProduct * (nav / (nav - ev.pnl || 1)) - 1) * 10000) / 100 || 0,
+    });
+  }
+
+  // Deduplicate by date (take last value per date)
+  const byDate = {};
+  results.forEach(r => { byDate[r.date] = r; });
+  return Object.values(byDate).sort((a, b) => a.date.localeCompare(b.date));
+}
+
 /* ── Image Compression ── */
 function compressImage(file, maxWidth = 1600, quality = 0.9) {
   return new Promise((resolve, reject) => {
@@ -455,6 +524,7 @@ function StockDatabook({ userId }) {
   const [tradesIndex, setTradesIndex] = useState([]);
   const [tradeStore, setTradeStore] = useState({});
   const [selectedTrade, setSelectedTrade] = useState(null);
+  const [capitalHistory, setCapitalHistory] = useState([]);
 
   const showToast = (msg) => {
     setToastMsg(msg);
@@ -477,7 +547,8 @@ function StockDatabook({ userId }) {
         const ci = await fsLoadCasesIndex(userId);
         const ji = await fsLoadJournalsIndex(userId);
         const ti = await fsLoadTradesIndex(userId);
-        if (!done) { setPatterns(p); setCasesIndex(ci); setJournalsIndex(ji); setTradesIndex(ti); }
+        const ch = await fsLoadCapitalHistory(userId);
+        if (!done) { setPatterns(p); setCasesIndex(ci); setJournalsIndex(ji); setTradesIndex(ti); setCapitalHistory(ch); }
         // No longer loading all cases upfront - they load on demand
       } catch (e) { console.error("Load error:", e); }
       done = true;
@@ -705,6 +776,12 @@ function StockDatabook({ userId }) {
     }
   };
 
+  const saveCapitalHistory = (items) => {
+    const sorted = [...items].sort((a, b) => a.date.localeCompare(b.date));
+    setCapitalHistory(sorted);
+    fsSaveCapitalHistory(userId, sorted);
+  };
+
   const importTlg = (text) => {
     const txns = parseTlg(text);
     if (txns.length === 0) { showToast("未找到交易紀錄"); return 0; }
@@ -803,8 +880,8 @@ function StockDatabook({ userId }) {
         {view === VIEWS.SEARCH && <SearchView casesIndex={casesIndex} caseStore={caseStore} loadCase={loadCaseOnDemand} getPattern={getPattern} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} allMktTags={allMktTags} setLightbox={setLightboxSrc} />}
         {view === VIEWS.JOURNAL && <JournalView journalsIndex={journalsIndex} journalStore={journalStore} loadJournal={loadJournalOnDemand} casesIndex={casesIndex} caseStore={caseStore} loadCase={loadCaseOnDemand} getPattern={getPattern} patterns={patterns} setLightbox={setLightboxSrc} onNew={(date) => { setEditingJournal({ date: date || new Date().toISOString().slice(0,10) }); setView(VIEWS.JOURNAL_EDIT); }} onEdit={(j) => { setEditingJournal(j); setView(VIEWS.JOURNAL_EDIT); }} onDelete={deleteJournalFn} openCase={(id) => { openCase(id); setView(VIEWS.CASES); }} />}
         {view === VIEWS.JOURNAL_EDIT && <JournalForm existing={editingJournal?.blocks ? editingJournal : (editingJournal?.date && journalStore[editingJournal.date]) || null} defaultDate={editingJournal?.date} allMktTags={allMktTags} casesIndex={casesIndex} getPattern={getPattern} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} onSave={(j) => { saveJournalFn(j); showToast("✓ 日誌已儲存"); setView(VIEWS.JOURNAL); }} onCancel={() => setView(VIEWS.JOURNAL)} />}
-        {view === VIEWS.TRADES && <TradesView tradesIndex={tradesIndex} tradeStore={tradeStore} loadTrade={loadTradeOnDemand} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} getPattern={getPattern} allMktTags={allMktTags} onImport={importTlg} onOpenTrade={(id) => { openTrade(id); setView(VIEWS.TRADE_DETAIL); }} onGoStats={() => setView(VIEWS.TRADE_STATS)} onGoAdd={() => setView(VIEWS.TRADE_ADD)} showToast={showToast} />}
-        {view === VIEWS.TRADE_DETAIL && <TradeDetailView trade={selectedTrade} tradeStore={tradeStore} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} getPattern={getPattern} allMktTags={allMktTags} setLightbox={setLightboxSrc} onSave={(t) => { saveTradeFn(t); setSelectedTrade(t); showToast("✓ 已更新"); }} onDelete={() => { if (selectedTrade) { deleteTradeFn(selectedTrade.id); setView(VIEWS.TRADES); } }} onBack={() => setView(VIEWS.TRADES)} />}
+        {view === VIEWS.TRADES && <TradesView tradesIndex={tradesIndex} tradeStore={tradeStore} loadTrade={loadTradeOnDemand} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} getPattern={getPattern} allMktTags={allMktTags} capitalHistory={capitalHistory} onSaveCapital={saveCapitalHistory} onImport={importTlg} onOpenTrade={(id) => { openTrade(id); setView(VIEWS.TRADE_DETAIL); }} onGoStats={() => setView(VIEWS.TRADE_STATS)} onGoAdd={() => setView(VIEWS.TRADE_ADD)} showToast={showToast} />}
+        {view === VIEWS.TRADE_DETAIL && <TradeDetailView trade={selectedTrade} tradeStore={tradeStore} tradesIndex={tradesIndex} capitalHistory={capitalHistory} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} getPattern={getPattern} allMktTags={allMktTags} setLightbox={setLightboxSrc} onSave={(t) => { saveTradeFn(t); setSelectedTrade(t); showToast("✓ 已更新"); }} onDelete={() => { if (selectedTrade) { deleteTradeFn(selectedTrade.id); setView(VIEWS.TRADES); } }} onBack={() => setView(VIEWS.TRADES)} />}
         {view === VIEWS.TRADE_STATS && <TradeStatsView tradesIndex={tradesIndex} tradeStore={tradeStore} loadTrade={loadTradeOnDemand} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} getPattern={getPattern} allMktTags={allMktTags} onBack={() => setView(VIEWS.TRADES)} />}
         {view === VIEWS.TRADE_ADD && <TradeForm patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} allMktTags={allMktTags} onSave={(t) => { saveTradeFn(t); showToast("✓ 新增成功"); setView(VIEWS.TRADES); }} onCancel={() => setView(VIEWS.TRADES)} />}
       </div>
@@ -2581,12 +2658,14 @@ function JournalForm({ existing, defaultDate, allMktTags, casesIndex, getPattern
 /* ══════════════════════════════════════════════════════════════
    TRADES VIEW — Dashboard
    ══════════════════════════════════════════════════════════════ */
-function TradesView({ tradesIndex, tradeStore, loadTrade, patterns, topPatterns, getChildren, getPattern, allMktTags, onImport, onOpenTrade, onGoStats, onGoAdd, showToast }) {
+function TradesView({ tradesIndex, tradeStore, loadTrade, patterns, topPatterns, getChildren, getPattern, allMktTags, capitalHistory, onSaveCapital, onImport, onOpenTrade, onGoStats, onGoAdd, showToast }) {
   const [period, setPeriod] = useState("ytd");
   const [customFrom, setCustomFrom] = useState("");
   const [customTo, setCustomTo] = useState("");
   const [patFilter, setPatFilter] = useState("");
   const [mktFilter, setMktFilter] = useState("");
+  const [showCapital, setShowCapital] = useState(false);
+  const [newDeposit, setNewDeposit] = useState({ date: new Date().toISOString().slice(0, 10), amount: "", type: "deposit" });
   const fileRef = useRef();
 
   const patternOptions = useMemo(() => {
@@ -2613,8 +2692,10 @@ function TradesView({ tradesIndex, tradeStore, loadTrade, patterns, topPatterns,
     return { from, to };
   }, [period, customFrom, customTo]);
 
+  const allClosed = useMemo(() => tradesIndex.filter(t => t.status === "closed"), [tradesIndex]);
+
   const filtered = useMemo(() => {
-    let list = tradesIndex.filter(t => t.status === "closed");
+    let list = allClosed;
     if (dateRange.from) list = list.filter(t => t.closeDate >= dateRange.from);
     if (dateRange.to) list = list.filter(t => t.closeDate <= dateRange.to);
     if (patFilter) {
@@ -2623,41 +2704,86 @@ function TradesView({ tradesIndex, tradeStore, loadTrade, patterns, topPatterns,
     }
     if (mktFilter) list = list.filter(t => (t.marketTags || []).includes(mktFilter));
     return list;
-  }, [tradesIndex, dateRange, patFilter, mktFilter, patterns]);
+  }, [allClosed, dateRange, patFilter, mktFilter, patterns]);
 
   const openTrades = useMemo(() => tradesIndex.filter(t => t.status === "open"), [tradesIndex]);
 
-  // Stats
   const stats = useMemo(() => {
     if (filtered.length === 0) return null;
     const wins = filtered.filter(t => t.pnl > 0);
     const losses = filtered.filter(t => t.pnl <= 0);
-    const totalTrades = filtered.length;
-    const winRate = totalTrades > 0 ? (wins.length / totalTrades) * 100 : 0;
-    const avgGain = wins.length > 0 ? wins.reduce((s, t) => s + t.pnl, 0) / wins.length : 0;
-    const avgLoss = losses.length > 0 ? losses.reduce((s, t) => s + t.pnl, 0) / losses.length : 0;
+    const n = filtered.length;
+    const winRate = n > 0 ? (wins.length / n) * 100 : 0;
+    const lossRate = 100 - winRate;
+    const avgGain$ = wins.length > 0 ? wins.reduce((s, t) => s + t.pnl, 0) / wins.length : 0;
+    const avgLoss$ = losses.length > 0 ? losses.reduce((s, t) => s + t.pnl, 0) / losses.length : 0;
     const avgGainPct = wins.length > 0 ? wins.reduce((s, t) => s + t.pnlPct, 0) / wins.length : 0;
     const avgLossPct = losses.length > 0 ? losses.reduce((s, t) => s + t.pnlPct, 0) / losses.length : 0;
-    const wlRatio = avgLoss !== 0 ? Math.abs(avgGain / avgLoss) : 0;
-    const adjWlRatio = wlRatio * (winRate / 100) / (1 - winRate / 100 || 1);
+    // 3 ratios
+    const pctRatio = avgLossPct !== 0 ? Math.abs(avgGainPct / avgLossPct) : 0;
+    const amtRatio = avgLoss$ !== 0 ? Math.abs(avgGain$ / avgLoss$) : 0;
+    const adjPctRatio = (lossRate > 0 && avgLossPct !== 0) ? (winRate * avgGainPct) / (lossRate * Math.abs(avgLossPct)) : 0;
     const maxGain = wins.length > 0 ? Math.max(...wins.map(t => t.pnl)) : 0;
     const maxLoss = losses.length > 0 ? Math.min(...losses.map(t => t.pnl)) : 0;
     const avgWinDays = wins.length > 0 ? wins.reduce((s, t) => s + (t.holdingDays || 0), 0) / wins.length : 0;
     const avgLossDays = losses.length > 0 ? losses.reduce((s, t) => s + (t.holdingDays || 0), 0) / losses.length : 0;
-    return { totalTrades, wins: wins.length, losses: losses.length, winRate, avgGain, avgLoss, avgGainPct, avgLossPct, wlRatio, adjWlRatio, maxGain, maxLoss, avgWinDays, avgLossDays };
+    return { n, wins: wins.length, losses: losses.length, winRate, avgGain$, avgLoss$, avgGainPct, avgLossPct, pctRatio, amtRatio, adjPctRatio, maxGain, maxLoss, avgWinDays, avgLossDays };
   }, [filtered]);
 
-  // Equity curve data
+  // Equity curve with TWRR
   const equityCurve = useMemo(() => {
     const sorted = [...filtered].sort((a, b) => a.closeDate.localeCompare(b.closeDate));
-    let cumPnl = 0;
-    let cumCost = 0;
-    return sorted.map(t => {
-      cumPnl += t.pnl;
-      cumCost += t.totalBuyCost;
-      return { date: t.closeDate, pnl: Math.round(cumPnl * 100) / 100, pct: cumCost > 0 ? Math.round((cumPnl / cumCost) * 10000) / 100 : 0 };
+    if (sorted.length === 0) return [];
+    if (!capitalHistory || capitalHistory.length === 0) {
+      // Fallback: simple cumulative P&L, no TWRR
+      let cumPnl = 0;
+      return sorted.map(t => { cumPnl += t.pnl; return { date: t.closeDate, pnl: Math.round(cumPnl * 100) / 100, pct: 0 }; });
+    }
+    // Full TWRR: track NAV through deposits and trade P&L
+    const events = [];
+    capitalHistory.forEach(d => {
+      if ((!dateRange.from || d.date >= dateRange.from) || d.date < (dateRange.from || ""))
+        events.push({ date: d.date, flow: d.type === "deposit" ? d.amount : -d.amount, pnl: 0 });
     });
-  }, [filtered]);
+    // Include all deposits before period start as initial capital
+    let initialCap = 0;
+    capitalHistory.forEach(d => {
+      if (dateRange.from && d.date < dateRange.from) initialCap += (d.type === "deposit" ? d.amount : -d.amount);
+    });
+    // Include realized P&L before period
+    allClosed.forEach(t => {
+      if (dateRange.from && t.closeDate < dateRange.from) initialCap += t.pnl;
+    });
+    sorted.forEach(t => events.push({ date: t.closeDate, flow: 0, pnl: t.pnl }));
+    events.sort((a, b) => a.date.localeCompare(b.date));
+
+    let nav = initialCap;
+    let cumPnl = 0;
+    const results = [];
+    sorted.forEach(t => {
+      // Add any deposits up to this trade's close date
+      capitalHistory.forEach(d => {
+        if (d.date <= t.closeDate && d.date >= (dateRange.from || "") && !results.some(r => r._depId === d.date + d.amount)) {
+          nav += (d.type === "deposit" ? d.amount : -d.amount);
+        }
+      });
+      cumPnl += t.pnl;
+      nav += t.pnl;
+      const twrrPct = initialCap > 0 ? (cumPnl / initialCap) * 100 : 0;
+      results.push({ date: t.closeDate, pnl: Math.round(cumPnl * 100) / 100, pct: Math.round(twrrPct * 100) / 100 });
+    });
+
+    // Dedup by date
+    const byDate = {};
+    results.forEach(r => { byDate[r.date] = r; });
+    return Object.values(byDate).sort((a, b) => a.date.localeCompare(b.date));
+  }, [filtered, capitalHistory, dateRange, allClosed]);
+
+  // Position size helper
+  const getPositionSize = (trade) => {
+    const cap = getCapitalAtDate(capitalHistory, allClosed, trade.openDate);
+    return cap > 0 ? Math.round((trade.totalBuyCost / cap) * 10000) / 100 : null;
+  };
 
   const handleFileUpload = (e) => {
     const file = e.target.files[0];
@@ -2671,9 +2797,20 @@ function TradesView({ tradesIndex, tradeStore, loadTrade, patterns, topPatterns,
     e.target.value = "";
   };
 
-  const recentClosed = useMemo(() => {
-    return [...filtered].sort((a, b) => b.closeDate.localeCompare(a.closeDate)).slice(0, 20);
-  }, [filtered]);
+  const addDeposit = () => {
+    if (!newDeposit.amount || !newDeposit.date) return;
+    const item = { date: newDeposit.date, amount: parseFloat(newDeposit.amount), type: newDeposit.type, id: genId() };
+    onSaveCapital([...capitalHistory, item]);
+    setNewDeposit({ date: new Date().toISOString().slice(0, 10), amount: "", type: "deposit" });
+    showToast("已新增資金紀錄");
+  };
+
+  const deleteDeposit = (id) => {
+    onSaveCapital(capitalHistory.filter(d => d.id !== id));
+    showToast("已刪除");
+  };
+
+  const recentClosed = useMemo(() => [...filtered].sort((a, b) => b.closeDate.localeCompare(a.closeDate)).slice(0, 30), [filtered]);
 
   const fmtMoney = (n) => {
     if (n === undefined || n === null) return "—";
@@ -2685,6 +2822,7 @@ function TradesView({ tradesIndex, tradeStore, loadTrade, patterns, topPatterns,
       <div style={S.flexBetween}>
         <div><div style={S.h1}>交易紀錄</div><div style={S.sub}>追蹤你的交易表現</div></div>
         <div style={S.flexGap(8)}>
+          <button style={S.btnOutline} onClick={() => setShowCapital(!showCapital)}>💰 資金管理</button>
           <button style={S.btnOutline} onClick={onGoStats}>📊 視覺統計</button>
           <button style={S.btnOutline} onClick={onGoAdd}>✏️ 手動新增</button>
           <button style={S.btn()} onClick={() => fileRef.current?.click()}>📁 匯入 TLG</button>
@@ -2692,53 +2830,70 @@ function TradesView({ tradesIndex, tradeStore, loadTrade, patterns, topPatterns,
         </div>
       </div>
 
+      {/* Capital Management */}
+      {showCapital && (
+        <div style={S.card}>
+          <div style={S.h3}>💰 入金 / 出金紀錄</div>
+          <div style={{ fontSize: 11, color: "#94A3B8", marginBottom: 10 }}>記錄帳戶入金與出金，用於計算報酬率 (TWRR) 和部位比重</div>
+          <div style={{ ...S.flexGap(8), marginBottom: 10 }}>
+            <input type="date" style={{ ...S.input, width: 140 }} value={newDeposit.date} onChange={e => setNewDeposit(p => ({ ...p, date: e.target.value }))} />
+            <select style={{ ...S.select, width: 100 }} value={newDeposit.type} onChange={e => setNewDeposit(p => ({ ...p, type: e.target.value }))}>
+              <option value="deposit">入金</option>
+              <option value="withdrawal">出金</option>
+            </select>
+            <input type="number" style={{ ...S.input, width: 150 }} value={newDeposit.amount} onChange={e => setNewDeposit(p => ({ ...p, amount: e.target.value }))} placeholder="金額" />
+            <button style={S.btn()} onClick={addDeposit}>新增</button>
+          </div>
+          {capitalHistory.length > 0 && (
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+              <thead><tr style={{ borderBottom: "1px solid #E2E8F0" }}>
+                <th style={{ textAlign: "left", padding: "6px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>日期</th>
+                <th style={{ textAlign: "left", padding: "6px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>類型</th>
+                <th style={{ textAlign: "right", padding: "6px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>金額</th>
+                <th style={{ padding: "6px" }}></th>
+              </tr></thead>
+              <tbody>
+                {capitalHistory.map(d => (
+                  <tr key={d.id || d.date} style={{ borderBottom: "1px solid #F1F5F9" }}>
+                    <td style={{ padding: "6px" }}>{d.date}</td>
+                    <td style={{ padding: "6px", color: d.type === "deposit" ? "#059669" : "#DC2626" }}>{d.type === "deposit" ? "入金" : "出金"}</td>
+                    <td style={{ padding: "6px", textAlign: "right" }}>${d.amount.toLocaleString()}</td>
+                    <td style={{ padding: "6px", textAlign: "right" }}>
+                      <button style={{ ...S.btnOutline, padding: "2px 8px", fontSize: 10, color: "#EF4444", borderColor: "#FECACA" }} onClick={() => deleteDeposit(d.id)}>刪除</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+
       {/* Filter bar */}
       <div style={{ ...S.card, ...S.flexGap(10), flexWrap: "wrap", padding: 14 }}>
         <div>
           <label style={S.label}>期間</label>
           <select style={{ ...S.select, width: 130 }} value={period} onChange={e => setPeriod(e.target.value)}>
-            <option value="ytd">YTD</option>
-            <option value="1m">近一個月</option>
-            <option value="3m">近三個月</option>
-            <option value="lastMonth">上個月</option>
-            <option value="1y">近一年</option>
-            <option value="custom">自訂</option>
+            <option value="ytd">YTD</option><option value="1m">近一個月</option><option value="3m">近三個月</option>
+            <option value="lastMonth">上個月</option><option value="1y">近一年</option><option value="custom">自訂</option>
           </select>
         </div>
         {period === "custom" && <>
-          <div>
-            <label style={S.label}>起始</label>
-            <input type="date" style={{ ...S.input, width: 140 }} value={customFrom} onChange={e => setCustomFrom(e.target.value)} />
-          </div>
-          <div>
-            <label style={S.label}>結束</label>
-            <input type="date" style={{ ...S.input, width: 140 }} value={customTo} onChange={e => setCustomTo(e.target.value)} />
-          </div>
+          <div><label style={S.label}>起始</label><input type="date" style={{ ...S.input, width: 140 }} value={customFrom} onChange={e => setCustomFrom(e.target.value)} /></div>
+          <div><label style={S.label}>結束</label><input type="date" style={{ ...S.input, width: 140 }} value={customTo} onChange={e => setCustomTo(e.target.value)} /></div>
         </>}
-        <div>
-          <label style={S.label}>型態分類</label>
-          <select style={{ ...S.select, width: 150 }} value={patFilter} onChange={e => setPatFilter(e.target.value)}>
-            <option value="">全部型態</option>
-            {patternOptions.map(o => <option key={o.id} value={o.id}>{o.label}</option>)}
-          </select>
-        </div>
-        <div>
-          <label style={S.label}>市場標籤</label>
-          <select style={{ ...S.select, width: 150 }} value={mktFilter} onChange={e => setMktFilter(e.target.value)}>
-            <option value="">全部標籤</option>
-            {allMktTags.map(t => <option key={t} value={t}>{t}</option>)}
-          </select>
-        </div>
+        <div><label style={S.label}>型態分類</label><select style={{ ...S.select, width: 150 }} value={patFilter} onChange={e => setPatFilter(e.target.value)}><option value="">全部型態</option>{patternOptions.map(o => <option key={o.id} value={o.id}>{o.label}</option>)}</select></div>
+        <div><label style={S.label}>市場標籤</label><select style={{ ...S.select, width: 150 }} value={mktFilter} onChange={e => setMktFilter(e.target.value)}><option value="">全部標籤</option>{allMktTags.map(t => <option key={t} value={t}>{t}</option>)}</select></div>
       </div>
 
-      {/* Stats cards */}
+      {/* Stats cards - 3 ratios */}
       {stats && (
         <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 10, marginBottom: 14 }}>
           <StatCard label="勝率" value={stats.winRate.toFixed(1) + "%"} sub={`${stats.wins}勝 ${stats.losses}負`} color="#059669" />
-          <StatCard label="平均獲利" value={"$" + stats.avgGain.toFixed(0)} sub={stats.avgGainPct.toFixed(2) + "%"} color="#059669" />
-          <StatCard label="平均虧損" value={"$" + stats.avgLoss.toFixed(0)} sub={stats.avgLossPct.toFixed(2) + "%"} color="#DC2626" />
-          <StatCard label="盈虧比" value={stats.wlRatio.toFixed(2)} sub={"調整: " + stats.adjWlRatio.toFixed(2)} color="#4F46E5" />
-          <StatCard label="總交易" value={stats.totalTrades} />
+          <StatCard label="平均獲利" value={"$" + stats.avgGain$.toFixed(0)} sub={stats.avgGainPct.toFixed(2) + "%"} color="#059669" />
+          <StatCard label="平均虧損" value={"$" + stats.avgLoss$.toFixed(0)} sub={stats.avgLossPct.toFixed(2) + "%"} color="#DC2626" />
+          <StatCard label="% 盈虧比" value={stats.pctRatio.toFixed(2)} sub={"金額: " + stats.amtRatio.toFixed(2)} color="#4F46E5" />
+          <StatCard label="調整盈虧比" value={stats.adjPctRatio.toFixed(2)} sub={"總交易: " + stats.n} color="#7C3AED" />
         </div>
       )}
       {stats && (
@@ -2753,7 +2908,7 @@ function TradesView({ tradesIndex, tradeStore, loadTrade, patterns, topPatterns,
       {/* Equity curve */}
       {equityCurve.length >= 1 && (
         <div style={S.card}>
-          <div style={S.h3}>報酬曲線</div>
+          <div style={S.h3}>報酬曲線{capitalHistory.length === 0 ? " (尚未設定入金，報酬率無法計算)" : ""}</div>
           <EquityCurveChart data={equityCurve} />
         </div>
       )}
@@ -2800,6 +2955,7 @@ function TradesView({ tradesIndex, tradeStore, loadTrade, patterns, topPatterns,
               <th style={{ textAlign: "left", padding: "7px 6px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>股票</th>
               <th style={{ textAlign: "right", padding: "7px 6px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>損益</th>
               <th style={{ textAlign: "right", padding: "7px 6px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>損益%</th>
+              <th style={{ textAlign: "right", padding: "7px 6px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>部位%</th>
               <th style={{ textAlign: "right", padding: "7px 6px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>持有天數</th>
               <th style={{ textAlign: "left", padding: "7px 6px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>平倉日</th>
               <th style={{ padding: "7px 6px" }}></th>
@@ -2807,16 +2963,13 @@ function TradesView({ tradesIndex, tradeStore, loadTrade, patterns, topPatterns,
             <tbody>
               {recentClosed.map(t => {
                 const p = getPattern(t.patternId);
+                const posPct = getPositionSize(t);
                 return (
                   <tr key={t.id} style={{ borderBottom: "1px solid #F1F5F9", cursor: "pointer" }} onClick={() => onOpenTrade(t.id)}>
-                    <td style={{ padding: "8px 6px" }}>
-                      <div style={S.flexGap(6)}>
-                        {p && <Dot color={p.color} size={7} />}
-                        <span style={{ fontWeight: 600 }}>{t.ticker}</span>
-                      </div>
-                    </td>
+                    <td style={{ padding: "8px 6px" }}><div style={S.flexGap(6)}>{p && <Dot color={p.color} size={7} />}<span style={{ fontWeight: 600 }}>{t.ticker}</span></div></td>
                     <td style={{ padding: "8px 6px", textAlign: "right", fontWeight: 600, color: t.pnl >= 0 ? "#059669" : "#DC2626" }}>{fmtMoney(t.pnl)}</td>
                     <td style={{ padding: "8px 6px", textAlign: "right", fontWeight: 600, color: t.pnlPct >= 0 ? "#059669" : "#DC2626" }}>{(t.pnlPct >= 0 ? "+" : "") + t.pnlPct.toFixed(2)}%</td>
+                    <td style={{ padding: "8px 6px", textAlign: "right", color: "#64748B" }}>{posPct !== null ? posPct.toFixed(1) + "%" : "—"}</td>
                     <td style={{ padding: "8px 6px", textAlign: "right" }}>{t.holdingDays}天</td>
                     <td style={{ padding: "8px 6px" }}>{t.closeDate}</td>
                     <td style={{ padding: "8px 6px", textAlign: "right", color: "#4F46E5", fontSize: 11 }}>詳情 →</td>
@@ -2834,51 +2987,45 @@ function TradesView({ tradesIndex, tradeStore, loadTrade, patterns, topPatterns,
 /* ── Equity Curve SVG Chart ── */
 function EquityCurveChart({ data }) {
   if (!data || data.length === 0) return null;
-  const W = 700, H = 180, PL = 55, PR = 50, PT = 15, PB = 28;
+  const W = 700, H = 160, PL = 50, PR = 45, PT = 12, PB = 22;
   const cw = W - PL - PR, ch = H - PT - PB;
-
-  // For single point, add a zero-origin point
   const chartData = data.length === 1 ? [{ date: data[0].date, pnl: 0, pct: 0 }, ...data] : data;
-
   const pnls = chartData.map(d => d.pnl);
   const pcts = chartData.map(d => d.pct);
   const minPnl = Math.min(0, ...pnls), maxPnl = Math.max(0, ...pnls);
   const rangePnl = maxPnl - minPnl || 1;
   const minPct = Math.min(0, ...pcts), maxPct = Math.max(0, ...pcts);
   const rangePct = maxPct - minPct || 1;
-
   const xStep = chartData.length > 1 ? cw / (chartData.length - 1) : cw;
   const yPnl = (v) => PT + ch - ((v - minPnl) / rangePnl) * ch;
-
   const linePath = chartData.map((d, i) => `${i === 0 ? "M" : "L"}${PL + i * xStep},${yPnl(d.pnl)}`).join(" ");
   const areaPath = linePath + ` L${PL + (chartData.length - 1) * xStep},${yPnl(0)} L${PL},${yPnl(0)} Z`;
-
-  const pnlTicks = 5;
+  const ticks = 5;
   const labelInterval = Math.max(1, Math.floor(chartData.length / 6));
 
   return (
     <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "auto" }}>
-      {Array.from({ length: pnlTicks + 1 }, (_, i) => {
-        const y = PT + (ch / pnlTicks) * i;
+      {Array.from({ length: ticks + 1 }, (_, i) => {
+        const y = PT + (ch / ticks) * i;
         return <line key={i} x1={PL} x2={W - PR} y1={y} y2={y} stroke="#F1F5F9" strokeWidth="1" />;
       })}
       {minPnl < 0 && <line x1={PL} x2={W - PR} y1={yPnl(0)} y2={yPnl(0)} stroke="#CBD5E1" strokeWidth="1" strokeDasharray="4,4" />}
       <path d={areaPath} fill="#4F46E520" />
-      <path d={linePath} fill="none" stroke="#4F46E5" strokeWidth="2" />
-      {Array.from({ length: pnlTicks + 1 }, (_, i) => {
-        const val = maxPnl - (rangePnl / pnlTicks) * i;
-        return <text key={`l${i}`} x={PL - 5} y={PT + (ch / pnlTicks) * i + 3} textAnchor="end" fontSize="9" fill="#94A3B8">${Math.round(val).toLocaleString()}</text>;
+      <path d={linePath} fill="none" stroke="#4F46E5" strokeWidth="1.5" />
+      {Array.from({ length: ticks + 1 }, (_, i) => {
+        const val = maxPnl - (rangePnl / ticks) * i;
+        return <text key={`l${i}`} x={PL - 4} y={PT + (ch / ticks) * i + 3} textAnchor="end" fontSize="7" fill="#94A3B8">${Math.round(val).toLocaleString()}</text>;
       })}
-      {Array.from({ length: pnlTicks + 1 }, (_, i) => {
-        const val = maxPct - (rangePct / pnlTicks) * i;
-        return <text key={`r${i}`} x={W - PR + 5} y={PT + (ch / pnlTicks) * i + 3} textAnchor="start" fontSize="9" fill="#94A3B8">{val.toFixed(1)}%</text>;
+      {Array.from({ length: ticks + 1 }, (_, i) => {
+        const val = maxPct - (rangePct / ticks) * i;
+        return <text key={`r${i}`} x={W - PR + 4} y={PT + (ch / ticks) * i + 3} textAnchor="start" fontSize="7" fill="#94A3B8">{val.toFixed(1)}%</text>;
       })}
       {chartData.map((d, i) => {
         if (i % labelInterval !== 0 && i !== chartData.length - 1) return null;
-        return <text key={i} x={PL + i * xStep} y={H - 6} textAnchor="middle" fontSize="9" fill="#94A3B8">{d.date.slice(5)}</text>;
+        return <text key={i} x={PL + i * xStep} y={H - 4} textAnchor="middle" fontSize="7" fill="#94A3B8">{d.date.slice(5)}</text>;
       })}
-      <text x={12} y={PT + ch / 2} textAnchor="middle" fontSize="9" fill="#94A3B8" transform={`rotate(-90,12,${PT + ch / 2})`}>金額 ($)</text>
-      <text x={W - 8} y={PT + ch / 2} textAnchor="middle" fontSize="9" fill="#94A3B8" transform={`rotate(90,${W - 8},${PT + ch / 2})`}>報酬率 (%)</text>
+      <text x={10} y={PT + ch / 2} textAnchor="middle" fontSize="7" fill="#94A3B8" transform={`rotate(-90,10,${PT + ch / 2})`}>金額 ($)</text>
+      <text x={W - 6} y={PT + ch / 2} textAnchor="middle" fontSize="7" fill="#94A3B8" transform={`rotate(90,${W - 6},${PT + ch / 2})`}>報酬率 (%)</text>
     </svg>
   );
 }
@@ -2886,7 +3033,7 @@ function EquityCurveChart({ data }) {
 /* ══════════════════════════════════════════════════════════════
    TRADE DETAIL VIEW
    ══════════════════════════════════════════════════════════════ */
-function TradeDetailView({ trade, tradeStore, patterns, topPatterns, getChildren, getPattern, allMktTags, setLightbox, onSave, onDelete, onBack }) {
+function TradeDetailView({ trade, tradeStore, tradesIndex, capitalHistory, patterns, topPatterns, getChildren, getPattern, allMktTags, setLightbox, onSave, onDelete, onBack }) {
   const [editing, setEditing] = useState(false);
   const [notes, setNotes] = useState(trade?.notes || "");
   const [patternId, setPatternId] = useState(trade?.patternId || "");
@@ -2894,18 +3041,21 @@ function TradeDetailView({ trade, tradeStore, patterns, topPatterns, getChildren
   const [images, setImages] = useState(trade?.images || []);
   const [mktTagInput, setMktTagInput] = useState("");
   const [showSuggestions, setShowSuggestions] = useState(false);
-  const [newBuy, setNewBuy] = useState(null); // { date, price, quantity }
+  const [newBuy, setNewBuy] = useState(null);
   const [newSell, setNewSell] = useState(null);
+  const [localBuys, setLocalBuys] = useState(trade?.buys || []);
+  const [localSells, setLocalSells] = useState(trade?.sells || []);
   const fileRef = useRef();
   const sugRef = useRef();
 
-  // Sync when trade changes
   useEffect(() => {
     if (trade) {
       setNotes(trade.notes || "");
       setPatternId(trade.patternId || "");
       setMarketTags(trade.marketTags || []);
       setImages(trade.images || []);
+      setLocalBuys(trade.buys || []);
+      setLocalSells(trade.sells || []);
     }
   }, [trade?.id]);
 
@@ -2934,27 +3084,20 @@ function TradeDetailView({ trade, tradeStore, patterns, topPatterns, getChildren
 
   const handleSave = () => {
     const tags = extractTags(notes);
-    let updatedTrade = { ...trade, notes, patternId, marketTags, images, tags };
-    // Add new manual buy if filled
+    let buys = [...localBuys];
+    let sells = [...localSells];
     if (newBuy && newBuy.price && newBuy.quantity) {
-      const qty = parseFloat(newBuy.quantity);
-      const price = parseFloat(newBuy.price);
-      updatedTrade.buys = [...updatedTrade.buys, {
-        tradeId: genId(), date: newBuy.date, time: "00:00:00",
-        price, quantity: qty, amount: qty * price, commission: 0, exchange: "MANUAL",
-      }];
+      const qty = parseFloat(newBuy.quantity), price = parseFloat(newBuy.price);
+      buys.push({ tradeId: genId(), date: newBuy.date, time: "00:00:00", price, quantity: qty, amount: qty * price, commission: 0, exchange: "MANUAL" });
       setNewBuy(null);
     }
-    // Add new manual sell if filled
     if (newSell && newSell.price && newSell.quantity) {
-      const qty = parseFloat(newSell.quantity);
-      const price = parseFloat(newSell.price);
-      // FIFO P&L calc for new sell
-      const isShort = updatedTrade.type === "short";
+      const qty = parseFloat(newSell.quantity), price = parseFloat(newSell.price);
+      const isShort = trade.type === "short";
       let pnlVal = 0, pnlPctVal = 0;
       if (!isShort) {
-        const fifoLots = updatedTrade.buys.map(b => ({ price: b.price, qty: b.quantity }));
-        const soldBefore = updatedTrade.sells.reduce((s, s2) => s + s2.quantity, 0);
+        const fifoLots = buys.map(b => ({ price: b.price, qty: b.quantity }));
+        const soldBefore = sells.reduce((s, s2) => s + s2.quantity, 0);
         let skip = soldBefore;
         for (const lot of fifoLots) { const c = Math.min(skip, lot.qty); lot.qty -= c; skip -= c; }
         let rem = qty, cost = 0;
@@ -2962,43 +3105,39 @@ function TradeDetailView({ trade, tradeStore, patterns, topPatterns, getChildren
         pnlVal = qty * price - cost;
         pnlPctVal = cost > 0 ? (pnlVal / cost) * 100 : 0;
       }
-      updatedTrade.sells = [...updatedTrade.sells, {
-        tradeId: genId(), date: newSell.date, time: "00:00:00",
-        price, quantity: qty, amount: qty * price, commission: 0, exchange: "MANUAL",
-        pnl: Math.round(pnlVal * 100) / 100, pnlPct: Math.round(pnlPctVal * 100) / 100,
-      }];
+      sells.push({ tradeId: genId(), date: newSell.date, time: "00:00:00", price, quantity: qty, amount: qty * price, commission: 0, exchange: "MANUAL", pnl: Math.round(pnlVal * 100) / 100, pnlPct: Math.round(pnlPctVal * 100) / 100 });
       setNewSell(null);
     }
-    onSave(finalizeTrade(updatedTrade));
+    onSave(finalizeTrade({ ...trade, buys, sells, notes, patternId, marketTags, images, tags }));
     setEditing(false);
   };
 
+  const deleteBuy = (idx) => { if (confirm("確定刪除此買進紀錄？")) setLocalBuys(prev => prev.filter((_, i) => i !== idx)); };
+  const deleteSell = (idx) => { if (confirm("確定刪除此賣出紀錄？")) setLocalSells(prev => prev.filter((_, i) => i !== idx)); };
+
   const handleImage = async (e) => {
     const files = Array.from(e.target.files).slice(0, 2 - images.length);
-    for (const file of files) {
-      const compressed = await compressImage(file);
-      setImages(prev => [...prev, compressed].slice(0, 2));
-    }
+    for (const file of files) { const compressed = await compressImage(file); setImages(prev => [...prev, compressed].slice(0, 2)); }
     e.target.value = "";
   };
 
   const addMktTag = (t) => {
     const tag = (t || mktTagInput).trim();
     if (tag && !marketTags.includes(tag)) setMarketTags(prev => [...prev, tag]);
-    setMktTagInput("");
-    setShowSuggestions(false);
+    setMktTagInput(""); setShowSuggestions(false);
   };
 
   const fmtMoney = (n) => (n >= 0 ? "+" : "") + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   const pat = getPattern(patternId);
+  const allClosedTrades = tradesIndex.filter(t => t.status === "closed");
+  const posPct = getCapitalAtDate(capitalHistory, allClosedTrades, trade.openDate);
+  const positionSize = posPct > 0 ? Math.round((trade.totalBuyCost / posPct) * 10000) / 100 : null;
 
   return (
     <div>
       <div style={{ ...S.flexGap(8), marginBottom: 14 }}>
         <button style={S.btnOutline} onClick={onBack}><Icon name="back" size={14} /> 返回</button>
       </div>
-
-      {/* Header */}
       <div style={S.card}>
         <div style={S.flexBetween}>
           <div style={S.flexGap(10)}>
@@ -3015,41 +3154,24 @@ function TradeDetailView({ trade, tradeStore, patterns, topPatterns, getChildren
             <button style={{ ...S.btnOutline, color: "#EF4444", borderColor: "#FECACA" }} onClick={onDelete}><Icon name="trash" size={13} /></button>
           </div>
         </div>
-        {/* Tags */}
         <div style={{ marginTop: 8, ...S.flexGap(6), flexWrap: "wrap" }}>
           {pat && <span style={S.tag(pat.color + "22", pat.color)}>{getPatternLabel(pat, patterns)}</span>}
           {marketTags.map(t => <span key={t} style={S.tag("#FEF3C7", "#92400E")}>📌 {t}</span>)}
         </div>
-        {/* Summary line */}
-        <div style={{ marginTop: 10, display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 10 }}>
-          <div style={{ textAlign: "center" }}>
-            <div style={{ fontSize: 11, color: "#94A3B8" }}>總損益</div>
-            <div style={{ fontSize: 18, fontWeight: 700, color: trade.pnl >= 0 ? "#059669" : "#DC2626" }}>{fmtMoney(trade.pnl)}</div>
-          </div>
-          <div style={{ textAlign: "center" }}>
-            <div style={{ fontSize: 11, color: "#94A3B8" }}>損益%</div>
-            <div style={{ fontSize: 18, fontWeight: 700, color: trade.pnlPct >= 0 ? "#059669" : "#DC2626" }}>{(trade.pnlPct >= 0 ? "+" : "") + trade.pnlPct.toFixed(2)}%</div>
-          </div>
-          <div style={{ textAlign: "center" }}>
-            <div style={{ fontSize: 11, color: "#94A3B8" }}>持有天數</div>
-            <div style={{ fontSize: 18, fontWeight: 700, color: "#4F46E5" }}>{trade.holdingDays}</div>
-          </div>
-          <div style={{ textAlign: "center" }}>
-            <div style={{ fontSize: 11, color: "#94A3B8" }}>均買價</div>
-            <div style={{ fontSize: 18, fontWeight: 700, color: "#334155" }}>${trade.avgBuyPrice}</div>
-          </div>
-          <div style={{ textAlign: "center" }}>
-            <div style={{ fontSize: 11, color: "#94A3B8" }}>佣金</div>
-            <div style={{ fontSize: 18, fontWeight: 700, color: "#94A3B8" }}>${trade.totalCommission}</div>
-          </div>
+        <div style={{ marginTop: 10, display: "grid", gridTemplateColumns: "repeat(6, 1fr)", gap: 8 }}>
+          <div style={{ textAlign: "center" }}><div style={{ fontSize: 11, color: "#94A3B8" }}>總損益</div><div style={{ fontSize: 16, fontWeight: 700, color: trade.pnl >= 0 ? "#059669" : "#DC2626" }}>{fmtMoney(trade.pnl)}</div></div>
+          <div style={{ textAlign: "center" }}><div style={{ fontSize: 11, color: "#94A3B8" }}>損益%</div><div style={{ fontSize: 16, fontWeight: 700, color: trade.pnlPct >= 0 ? "#059669" : "#DC2626" }}>{(trade.pnlPct >= 0 ? "+" : "") + trade.pnlPct.toFixed(2)}%</div></div>
+          <div style={{ textAlign: "center" }}><div style={{ fontSize: 11, color: "#94A3B8" }}>持有天數</div><div style={{ fontSize: 16, fontWeight: 700, color: "#4F46E5" }}>{trade.holdingDays}</div></div>
+          <div style={{ textAlign: "center" }}><div style={{ fontSize: 11, color: "#94A3B8" }}>均買價</div><div style={{ fontSize: 16, fontWeight: 700, color: "#334155" }}>${trade.avgBuyPrice}</div></div>
+          <div style={{ textAlign: "center" }}><div style={{ fontSize: 11, color: "#94A3B8" }}>部位比重</div><div style={{ fontSize: 16, fontWeight: 700, color: "#7C3AED" }}>{positionSize !== null ? positionSize.toFixed(1) + "%" : "—"}</div></div>
+          <div style={{ textAlign: "center" }}><div style={{ fontSize: 11, color: "#94A3B8" }}>佣金</div><div style={{ fontSize: 16, fontWeight: 700, color: "#94A3B8" }}>${trade.totalCommission}</div></div>
         </div>
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
-        {/* Buys */}
         <div style={S.card}>
           <div style={{ ...S.flexBetween, marginBottom: 6 }}>
-            <div style={S.h3}>買進紀錄 ({trade.buys.length} 筆)</div>
+            <div style={S.h3}>買進紀錄 ({localBuys.length} 筆)</div>
             {editing && !newBuy && <button style={{ ...S.btnOutline, padding: "3px 10px", fontSize: 11 }} onClick={() => setNewBuy({ date: new Date().toISOString().slice(0, 10), price: "", quantity: "" })}>+ 手動加</button>}
           </div>
           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
@@ -3058,20 +3180,22 @@ function TradeDetailView({ trade, tradeStore, patterns, topPatterns, getChildren
               <th style={{ textAlign: "right", padding: "6px 4px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>價格</th>
               <th style={{ textAlign: "right", padding: "6px 4px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>股數</th>
               <th style={{ textAlign: "right", padding: "6px 4px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>金額</th>
+              {editing && <th style={{ padding: "6px 4px" }}></th>}
             </tr></thead>
             <tbody>
-              {trade.buys.map((b, i) => (
+              {localBuys.map((b, i) => (
                 <tr key={i} style={{ borderBottom: "1px solid #F1F5F9" }}>
                   <td style={{ padding: "6px 4px" }}>{b.date}</td>
                   <td style={{ padding: "6px 4px", textAlign: "right" }}>${b.price.toFixed(2)}</td>
                   <td style={{ padding: "6px 4px", textAlign: "right" }}>{b.quantity}</td>
                   <td style={{ padding: "6px 4px", textAlign: "right" }}>${b.amount.toFixed(2)}</td>
+                  {editing && <td style={{ padding: "6px 4px", textAlign: "right" }}><button style={{ ...S.btnOutline, padding: "1px 6px", fontSize: 10, color: "#EF4444", borderColor: "#FECACA" }} onClick={() => deleteBuy(i)}>✕</button></td>}
                 </tr>
               ))}
             </tbody>
           </table>
           {editing && newBuy && (
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 80px 60px 50px", gap: 4, marginTop: 8, alignItems: "end" }}>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 80px 60px 30px", gap: 4, marginTop: 8, alignItems: "end" }}>
               <div><label style={S.label}>日期</label><input type="date" style={S.input} value={newBuy.date} onChange={e => setNewBuy(p => ({ ...p, date: e.target.value }))} /></div>
               <div><label style={S.label}>價格</label><input type="number" step="0.01" style={S.input} value={newBuy.price} onChange={e => setNewBuy(p => ({ ...p, price: e.target.value }))} /></div>
               <div><label style={S.label}>股數</label><input type="number" style={S.input} value={newBuy.quantity} onChange={e => setNewBuy(p => ({ ...p, quantity: e.target.value }))} /></div>
@@ -3079,11 +3203,9 @@ function TradeDetailView({ trade, tradeStore, patterns, topPatterns, getChildren
             </div>
           )}
         </div>
-
-        {/* Sells */}
         <div style={S.card}>
           <div style={{ ...S.flexBetween, marginBottom: 6 }}>
-            <div style={S.h3}>賣出紀錄 ({trade.sells.length} 筆)</div>
+            <div style={S.h3}>賣出紀錄 ({localSells.length} 筆)</div>
             {editing && !newSell && <button style={{ ...S.btnOutline, padding: "3px 10px", fontSize: 11 }} onClick={() => setNewSell({ date: new Date().toISOString().slice(0, 10), price: "", quantity: "" })}>+ 手動加</button>}
           </div>
           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
@@ -3093,21 +3215,23 @@ function TradeDetailView({ trade, tradeStore, patterns, topPatterns, getChildren
               <th style={{ textAlign: "right", padding: "6px 4px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>股數</th>
               <th style={{ textAlign: "right", padding: "6px 4px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>損益</th>
               <th style={{ textAlign: "right", padding: "6px 4px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>損益%</th>
+              {editing && <th style={{ padding: "6px 4px" }}></th>}
             </tr></thead>
             <tbody>
-              {trade.sells.map((s, i) => (
+              {localSells.map((s, i) => (
                 <tr key={i} style={{ borderBottom: "1px solid #F1F5F9" }}>
                   <td style={{ padding: "6px 4px" }}>{s.date}</td>
                   <td style={{ padding: "6px 4px", textAlign: "right" }}>${s.price.toFixed(2)}</td>
                   <td style={{ padding: "6px 4px", textAlign: "right" }}>{s.quantity}</td>
-                  <td style={{ padding: "6px 4px", textAlign: "right", fontWeight: 600, color: (s.pnl||0) >= 0 ? "#059669" : "#DC2626" }}>{fmtMoney(s.pnl||0)}</td>
-                  <td style={{ padding: "6px 4px", textAlign: "right", fontWeight: 600, color: (s.pnlPct||0) >= 0 ? "#059669" : "#DC2626" }}>{((s.pnlPct||0) >= 0 ? "+" : "") + (s.pnlPct||0).toFixed(2)}%</td>
+                  <td style={{ padding: "6px 4px", textAlign: "right", fontWeight: 600, color: s.pnl >= 0 ? "#059669" : "#DC2626" }}>{fmtMoney(s.pnl)}</td>
+                  <td style={{ padding: "6px 4px", textAlign: "right", fontWeight: 600, color: s.pnlPct >= 0 ? "#059669" : "#DC2626" }}>{(s.pnlPct >= 0 ? "+" : "") + s.pnlPct.toFixed(2)}%</td>
+                  {editing && <td style={{ padding: "6px 4px", textAlign: "right" }}><button style={{ ...S.btnOutline, padding: "1px 6px", fontSize: 10, color: "#EF4444", borderColor: "#FECACA" }} onClick={() => deleteSell(i)}>✕</button></td>}
                 </tr>
               ))}
             </tbody>
           </table>
           {editing && newSell && (
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 80px 60px 50px", gap: 4, marginTop: 8, alignItems: "end" }}>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 80px 60px 30px", gap: 4, marginTop: 8, alignItems: "end" }}>
               <div><label style={S.label}>日期</label><input type="date" style={S.input} value={newSell.date} onChange={e => setNewSell(p => ({ ...p, date: e.target.value }))} /></div>
               <div><label style={S.label}>價格</label><input type="number" step="0.01" style={S.input} value={newSell.price} onChange={e => setNewSell(p => ({ ...p, price: e.target.value }))} /></div>
               <div><label style={S.label}>股數</label><input type="number" style={S.input} value={newSell.quantity} onChange={e => setNewSell(p => ({ ...p, quantity: e.target.value }))} /></div>
@@ -3117,107 +3241,45 @@ function TradeDetailView({ trade, tradeStore, patterns, topPatterns, getChildren
         </div>
       </div>
 
-      {/* Edit section */}
       {editing && (
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
           <div>
-            <div style={S.card}>
-              <div style={S.h3}>型態分類</div>
-              <select style={S.select} value={patternId} onChange={e => setPatternId(e.target.value)}>
-                <option value="">未分類</option>
-                {patternOptions.map(o => <option key={o.id} value={o.id}>{o.label}</option>)}
-              </select>
-            </div>
+            <div style={S.card}><div style={S.h3}>型態分類</div><select style={S.select} value={patternId} onChange={e => setPatternId(e.target.value)}><option value="">未分類</option>{patternOptions.map(o => <option key={o.id} value={o.id}>{o.label}</option>)}</select></div>
             <div style={S.card}>
               <div style={S.h3}>市場標籤</div>
               <div ref={sugRef} style={{ position: "relative" }}>
                 <div style={S.flexGap(6)}>
-                  <input style={{ ...S.input, flex: 1 }} value={mktTagInput}
-                    onChange={e => { setMktTagInput(e.target.value); setShowSuggestions(true); }}
-                    onFocus={() => setShowSuggestions(true)}
-                    placeholder="輸入標籤..."
-                    onKeyDown={e => { if (e.key === "Enter") { e.preventDefault(); addMktTag(); } }} />
+                  <input style={{ ...S.input, flex: 1 }} value={mktTagInput} onChange={e => { setMktTagInput(e.target.value); setShowSuggestions(true); }} onFocus={() => setShowSuggestions(true)} placeholder="輸入標籤..." onKeyDown={e => { if (e.key === "Enter") { e.preventDefault(); addMktTag(); } }} />
                   <button style={S.btn()} onClick={() => addMktTag()}>加入</button>
                 </div>
                 {showSuggestions && mktSuggestions.length > 0 && (
                   <div style={{ position: "absolute", top: "100%", left: 0, right: 70, marginTop: 2, background: "#FFF", border: "1px solid #E2E8F0", borderRadius: 7, boxShadow: "0 4px 16px rgba(0,0,0,0.08)", zIndex: 10, maxHeight: 150, overflowY: "auto" }}>
-                    {mktSuggestions.map(t => (
-                      <div key={t} style={{ padding: "6px 12px", cursor: "pointer", fontSize: 12.5 }}
-                        onMouseDown={e => { e.preventDefault(); addMktTag(t); }}
-                        onMouseEnter={e => e.currentTarget.style.background = "#F8FAFC"}
-                        onMouseLeave={e => e.currentTarget.style.background = "transparent"}>📌 {t}</div>
-                    ))}
+                    {mktSuggestions.map(t => (<div key={t} style={{ padding: "6px 12px", cursor: "pointer", fontSize: 12.5 }} onMouseDown={e => { e.preventDefault(); addMktTag(t); }} onMouseEnter={e => e.currentTarget.style.background = "#F8FAFC"} onMouseLeave={e => e.currentTarget.style.background = "transparent"}>📌 {t}</div>))}
                   </div>
                 )}
               </div>
-              {marketTags.length > 0 && (
-                <div style={{ marginTop: 6 }}>
-                  {marketTags.map(t => (
-                    <span key={t} style={{ ...S.tag("#FEF3C7", "#92400E"), cursor: "pointer" }} onClick={() => setMarketTags(prev => prev.filter(x => x !== t))}>📌 {t} ✕</span>
-                  ))}
-                </div>
-              )}
+              {marketTags.length > 0 && <div style={{ marginTop: 6 }}>{marketTags.map(t => <span key={t} style={{ ...S.tag("#FEF3C7", "#92400E"), cursor: "pointer" }} onClick={() => setMarketTags(prev => prev.filter(x => x !== t))}>📌 {t} ✕</span>)}</div>}
             </div>
-            <div style={S.card}>
-              <div style={S.h3}>交易心得</div>
-              <textarea style={{ ...S.textarea, minHeight: 100 }} value={notes} onChange={e => setNotes(e.target.value)} placeholder="記錄你的交易反思... 使用 #標籤" />
-              {extractTags(notes).length > 0 && (
-                <div style={{ marginTop: 6 }}>
-                  {extractTags(notes).map(t => <span key={t} style={S.tag()}>#{t}</span>)}
-                </div>
-              )}
-            </div>
+            <div style={S.card}><div style={S.h3}>交易心得</div><textarea style={{ ...S.textarea, minHeight: 100 }} value={notes} onChange={e => setNotes(e.target.value)} placeholder="記錄你的交易反思... 使用 #標籤" />{extractTags(notes).length > 0 && <div style={{ marginTop: 6 }}>{extractTags(notes).map(t => <span key={t} style={S.tag()}>#{t}</span>)}</div>}</div>
           </div>
           <div>
             <div style={S.card}>
               <div style={S.h3}>截圖（最多2張）</div>
-              {images.map((img, i) => (
-                <div key={i} style={{ position: "relative", marginBottom: 10 }}>
-                  <img src={img} alt="" style={{ ...S.img, maxHeight: 240 }} onClick={() => setLightbox(img)} />
-                  <button onClick={() => setImages(prev => prev.filter((_, j) => j !== i))} style={{ position: "absolute", top: 6, right: 6, background: "rgba(0,0,0,0.5)", color: "#FFF", border: "none", borderRadius: "50%", width: 26, height: 26, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                    <Icon name="x" size={13} />
-                  </button>
-                </div>
-              ))}
-              {images.length < 2 && (
-                <div onClick={() => fileRef.current?.click()} style={{ border: "2px dashed #D1D5DB", borderRadius: 8, padding: 28, textAlign: "center", cursor: "pointer", color: "#94A3B8" }}>
-                  <Icon name="img" size={28} />
-                  <div style={{ marginTop: 6, fontSize: 12.5, fontWeight: 500 }}>點擊上傳圖片</div>
-                  <input ref={fileRef} type="file" accept="image/*" style={{ display: "none" }} onChange={handleImage} />
-                </div>
-              )}
+              {images.map((img, i) => (<div key={i} style={{ position: "relative", marginBottom: 10 }}><img src={img} alt="" style={{ ...S.img, maxHeight: 240 }} onClick={() => setLightbox(img)} /><button onClick={() => setImages(prev => prev.filter((_, j) => j !== i))} style={{ position: "absolute", top: 6, right: 6, background: "rgba(0,0,0,0.5)", color: "#FFF", border: "none", borderRadius: "50%", width: 26, height: 26, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}><Icon name="x" size={13} /></button></div>))}
+              {images.length < 2 && (<div onClick={() => fileRef.current?.click()} style={{ border: "2px dashed #D1D5DB", borderRadius: 8, padding: 28, textAlign: "center", cursor: "pointer", color: "#94A3B8" }}><Icon name="img" size={28} /><div style={{ marginTop: 6, fontSize: 12.5, fontWeight: 500 }}>點擊上傳圖片</div><input ref={fileRef} type="file" accept="image/*" style={{ display: "none" }} onChange={handleImage} /></div>)}
             </div>
             <div style={{ ...S.flexGap(8), justifyContent: "flex-end", marginTop: 10 }}>
-              <button style={S.btnOutline} onClick={() => setEditing(false)}>取消</button>
+              <button style={S.btnOutline} onClick={() => { setEditing(false); setLocalBuys(trade.buys || []); setLocalSells(trade.sells || []); }}>取消</button>
               <button style={S.btn()} onClick={handleSave}>儲存</button>
             </div>
           </div>
         </div>
       )}
 
-      {/* Show notes/images when not editing */}
       {!editing && (notes || images.length > 0) && (
         <div style={{ display: "grid", gridTemplateColumns: images.length > 0 ? "1fr 1fr" : "1fr", gap: 14 }}>
-          {notes && (
-            <div style={S.card}>
-              <div style={S.h3}>交易心得</div>
-              <div style={{ fontSize: 13, lineHeight: 1.7, whiteSpace: "pre-wrap", color: "#334155" }}>
-                {notes.split(/(#[\w\u4e00-\u9fff\u3400-\u4dbf]+)/g).map((part, i) =>
-                  part.match(/^#[\w\u4e00-\u9fff\u3400-\u4dbf]+$/) ?
-                    <span key={i} style={{ color: "#4F46E5", fontWeight: 600, background: "#EEF2FF", padding: "1px 4px", borderRadius: 3 }}>{part}</span> :
-                    <span key={i}>{part}</span>
-                )}
-              </div>
-            </div>
-          )}
-          {images.length > 0 && (
-            <div style={S.card}>
-              <div style={S.h3}>截圖</div>
-              {images.map((img, i) => (
-                <img key={i} src={img} alt="" style={{ ...S.img, maxHeight: 280, marginBottom: i < images.length - 1 ? 10 : 0 }} onClick={() => setLightbox(img)} />
-              ))}
-            </div>
-          )}
+          {notes && (<div style={S.card}><div style={S.h3}>交易心得</div><div style={{ fontSize: 13, lineHeight: 1.7, whiteSpace: "pre-wrap", color: "#334155" }}>{notes.split(/(#[\w\u4e00-\u9fff\u3400-\u4dbf]+)/g).map((part, i) => part.match(/^#[\w\u4e00-\u9fff\u3400-\u4dbf]+$/) ? <span key={i} style={{ color: "#4F46E5", fontWeight: 600, background: "#EEF2FF", padding: "1px 4px", borderRadius: 3 }}>{part}</span> : <span key={i}>{part}</span>)}</div></div>)}
+          {images.length > 0 && (<div style={S.card}><div style={S.h3}>截圖</div>{images.map((img, i) => <img key={i} src={img} alt="" style={{ ...S.img, maxHeight: 280, marginBottom: i < images.length - 1 ? 10 : 0 }} onClick={() => setLightbox(img)} />)}</div>)}
         </div>
       )}
     </div>
@@ -3225,7 +3287,7 @@ function TradeDetailView({ trade, tradeStore, patterns, topPatterns, getChildren
 }
 
 /* ══════════════════════════════════════════════════════════════
-   TRADE STATS VIEW — Visual Statistics
+   TRADE STATS VIEW — Visual Statistics (X=% range, Y=count)
    ══════════════════════════════════════════════════════════════ */
 function TradeStatsView({ tradesIndex, tradeStore, loadTrade, patterns, topPatterns, getChildren, getPattern, allMktTags, onBack }) {
   const [period, setPeriod] = useState("ytd");
@@ -3236,10 +3298,7 @@ function TradeStatsView({ tradesIndex, tradeStore, loadTrade, patterns, topPatte
 
   const patternOptions = useMemo(() => {
     const opts = [];
-    topPatterns.forEach(p => {
-      opts.push({ id: p.id, label: p.name });
-      getChildren(p.id).forEach(c => opts.push({ id: c.id, label: `  └ ${c.name}` }));
-    });
+    topPatterns.forEach(p => { opts.push({ id: p.id, label: p.name }); getChildren(p.id).forEach(c => opts.push({ id: c.id, label: `  └ ${c.name}` })); });
     return opts;
   }, [topPatterns, getChildren]);
 
@@ -3250,11 +3309,8 @@ function TradeStatsView({ tradesIndex, tradeStore, loadTrade, patterns, topPatte
     else if (period === "1m") { const d = new Date(now); d.setMonth(d.getMonth() - 1); from = d.toISOString().slice(0, 10); }
     else if (period === "3m") { const d = new Date(now); d.setMonth(d.getMonth() - 3); from = d.toISOString().slice(0, 10); }
     else if (period === "1y") { const d = new Date(now); d.setFullYear(d.getFullYear() - 1); from = d.toISOString().slice(0, 10); }
-    else if (period === "lastMonth") {
-      const d = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-      from = d.toISOString().slice(0, 10);
-      to = new Date(now.getFullYear(), now.getMonth(), 0).toISOString().slice(0, 10);
-    } else if (period === "custom") { from = customFrom; to = customTo; }
+    else if (period === "lastMonth") { const d = new Date(now.getFullYear(), now.getMonth() - 1, 1); from = d.toISOString().slice(0, 10); to = new Date(now.getFullYear(), now.getMonth(), 0).toISOString().slice(0, 10); }
+    else if (period === "custom") { from = customFrom; to = customTo; }
     return { from, to };
   }, [period, customFrom, customTo]);
 
@@ -3262,10 +3318,7 @@ function TradeStatsView({ tradesIndex, tradeStore, loadTrade, patterns, topPatte
     let list = tradesIndex.filter(t => t.status === "closed");
     if (dateRange.from) list = list.filter(t => t.closeDate >= dateRange.from);
     if (dateRange.to) list = list.filter(t => t.closeDate <= dateRange.to);
-    if (patFilter) {
-      const allIds = getDescendantIds(patFilter, patterns);
-      list = list.filter(t => allIds.includes(t.patternId));
-    }
+    if (patFilter) { const allIds = getDescendantIds(patFilter, patterns); list = list.filter(t => allIds.includes(t.patternId)); }
     if (mktFilter) list = list.filter(t => (t.marketTags || []).includes(mktFilter));
     return list.sort((a, b) => a.closeDate.localeCompare(b.closeDate));
   }, [tradesIndex, dateRange, patFilter, mktFilter, patterns]);
@@ -3277,108 +3330,104 @@ function TradeStatsView({ tradesIndex, tradeStore, loadTrade, patterns, topPatte
   const avgGain = wins.length > 0 ? wins.reduce((s, t) => s + t.pnlPct, 0) / wins.length : 0;
   const avgLoss = losses.length > 0 ? losses.reduce((s, t) => s + t.pnlPct, 0) / losses.length : 0;
   const avgReturn = totalTrades > 0 ? closed.reduce((s, t) => s + t.pnlPct, 0) / totalTrades : 0;
-  const wlRatio = avgLoss !== 0 ? Math.abs(avgGain / avgLoss) : 0;
-  const adjWlRatio = (1 - winRate / 100) !== 0 ? wlRatio * (winRate / 100) / (1 - winRate / 100) : 0;
+  const pctRatio = avgLoss !== 0 ? Math.abs(avgGain / avgLoss) : 0;
+  const adjPctRatio = (100 - winRate) > 0 && avgLoss !== 0 ? (winRate * avgGain) / ((100 - winRate) * Math.abs(avgLoss)) : 0;
 
-  // Range distribution (0-2%, 2-4%, ... 36-38%)
+  // Range distribution for charts: X axis = % range, Y axis = count
   const ranges = useMemo(() => {
     const buckets = [];
-    for (let i = 0; i <= 18; i++) {
-      buckets.push({ min: i * 2, max: (i + 1) * 2, gains: 0, losses: 0 });
-    }
+    for (let i = 0; i <= 18; i++) buckets.push({ min: i * 2, max: (i + 1) * 2, label: `${i * 2}-${(i + 1) * 2}%`, gains: 0, losses: 0 });
     closed.forEach(t => {
       const absPct = Math.abs(t.pnlPct);
       const idx = Math.min(Math.floor(absPct / 2), buckets.length - 1);
-      if (t.pnl > 0) buckets[idx].gains++;
-      else buckets[idx].losses++;
+      if (t.pnl > 0) buckets[idx].gains++; else buckets[idx].losses++;
     });
     return buckets;
   }, [closed]);
 
-  // Gains/losses bar chart data
-  const barData = closed.map(t => t.pnlPct);
-
-  // DRMA curve (cumulative R)
-  const drmaData = useMemo(() => {
-    let cum = 0;
-    return closed.map(t => {
-      cum += t.pnlPct;
-      return cum;
-    });
-  }, [closed]);
-
-  // Gain magnitude / loss magnitude
-  const gainMags = wins.map(t => t.pnlPct).sort((a, b) => b - a);
-  const lossMags = losses.map(t => Math.abs(t.pnlPct)).sort((a, b) => b - a);
-
-  const MiniBar = ({ values, color }) => {
-    if (values.length === 0) return <div style={{ color: "#CBD5E1", fontSize: 11 }}>無資料</div>;
-    const mx = Math.max(...values);
-    const PL = 40, PR = 10, PT = 10, PB = 20;
-    const bw = Math.max(6, Math.min(20, 300 / values.length));
-    const totalW = PL + PR + values.length * (bw + 2);
+  // Chart: X = % ranges, Y = count of trades
+  const RangeBarChart = ({ data, title, mode }) => {
+    // mode: "gl" for gains & losses side by side, "magnitude" for single color, "drma" for net
+    const maxCount = Math.max(...data.map(d => mode === "gl" ? Math.max(d.gains, d.losses) : (d.gains + d.losses)), 1);
+    const PL = 30, PR = 10, PT = 10, PB = 30;
+    const bw = mode === "gl" ? 10 : 16;
+    const gap = mode === "gl" ? 22 : 20;
+    const totalW = PL + PR + data.length * gap;
     const chartH = 80;
     const H = chartH + PT + PB;
     const ticks = 4;
+    const hasData = data.some(d => d.gains > 0 || d.losses > 0);
+    if (!hasData) return <div style={{ color: "#CBD5E1", fontSize: 11 }}>無資料</div>;
+
     return (
       <svg viewBox={`0 0 ${totalW} ${H}`} style={{ width: "100%", height: H }}>
         {Array.from({ length: ticks + 1 }, (_, i) => {
-          const val = mx - (mx / ticks) * i;
+          const val = maxCount - (maxCount / ticks) * i;
           const y = PT + (chartH / ticks) * i;
-          return <g key={i}>
-            <line x1={PL} x2={totalW - PR} y1={y} y2={y} stroke="#F1F5F9" strokeWidth="0.5" />
-            <text x={PL - 4} y={y + 3} textAnchor="end" fontSize="8" fill="#94A3B8">{val.toFixed(1)}%</text>
-          </g>;
+          return <g key={i}><line x1={PL} x2={totalW - PR} y1={y} y2={y} stroke="#F1F5F9" strokeWidth="0.5" /><text x={PL - 3} y={y + 3} textAnchor="end" fontSize="7" fill="#94A3B8">{Math.round(val)}</text></g>;
         })}
-        {values.map((v, i) => {
-          const h = mx > 0 ? (v / mx) * chartH : 0;
-          return <rect key={i} x={PL + i * (bw + 2)} y={PT + chartH - h} width={bw} height={h} fill={color} rx="1" />;
-        })}
-        {values.map((v, i) => {
-          if (values.length <= 10 || i % Math.ceil(values.length / 8) === 0)
-            return <text key={i} x={PL + i * (bw + 2) + bw / 2} y={H - 4} textAnchor="middle" fontSize="7" fill="#94A3B8">{i + 1}</text>;
-          return null;
+        {data.map((d, i) => {
+          const x = PL + i * gap;
+          if (mode === "gl") {
+            const hG = maxCount > 0 ? (d.gains / maxCount) * chartH : 0;
+            const hL = maxCount > 0 ? (d.losses / maxCount) * chartH : 0;
+            return <g key={i}>
+              <rect x={x} y={PT + chartH - hG} width={bw - 1} height={hG} fill="#34D399" rx="1" />
+              <rect x={x + bw} y={PT + chartH - hL} width={bw - 1} height={hL} fill="#F87171" rx="1" />
+              <text x={x + bw} y={H - 6} textAnchor="middle" fontSize="6" fill="#94A3B8" transform={`rotate(-45,${x + bw},${H - 6})`}>{d.label}</text>
+            </g>;
+          } else {
+            const count = mode === "gains" ? d.gains : mode === "losses" ? d.losses : d.gains + d.losses;
+            const h = maxCount > 0 ? (count / maxCount) * chartH : 0;
+            const color = mode === "gains" ? "#34D399" : mode === "losses" ? "#F87171" : "#4F46E5";
+            return <g key={i}>
+              <rect x={x} y={PT + chartH - h} width={bw} height={h} fill={color} rx="1" />
+              <text x={x + bw / 2} y={H - 6} textAnchor="middle" fontSize="6" fill="#94A3B8" transform={`rotate(-45,${x + bw / 2},${H - 6})`}>{d.label}</text>
+            </g>;
+          }
         })}
       </svg>
     );
   };
 
-  // Axis-enabled bar chart for Gains/Losses and DRMA
-  const AxisBarChart = ({ data, getColor }) => {
-    if (data.length === 0) return <div style={{ color: "#CBD5E1", fontSize: 11 }}>無資料</div>;
-    const PL = 40, PR = 10, PT = 8, PB = 20;
-    const bw = Math.max(6, Math.min(20, 360 / data.length));
-    const totalW = PL + PR + data.length * (bw + 2);
-    const chartH = 90;
-    const H = chartH + PT + PB;
-    const maxAbs = Math.max(...data.map(Math.abs), 0.01);
+  // DRMA data: per bucket, compute DRMA
+  const drmaRanges = ranges.map(r => {
+    const mid = (r.min + r.max) / 2;
+    const drma = r.gains * mid - r.losses * mid;
+    return { ...r, drma };
+  });
+
+  const DRMAChart = () => {
+    const vals = drmaRanges.map(r => r.drma);
+    const maxAbs = Math.max(...vals.map(Math.abs), 0.01);
+    const PL = 30, PR = 10, PT = 10, PB = 30;
+    const gap = 20, bw = 16;
+    const totalW = PL + PR + drmaRanges.length * gap;
+    const chartH = 80, H = chartH + PT + PB;
     const midY = PT + chartH / 2;
-    const ticks = 4;
+    const hasData = vals.some(v => v !== 0);
+    if (!hasData) return <div style={{ color: "#CBD5E1", fontSize: 11 }}>無資料</div>;
 
     return (
       <svg viewBox={`0 0 ${totalW} ${H}`} style={{ width: "100%", height: H }}>
-        {/* Grid + Y labels */}
-        {Array.from({ length: ticks + 1 }, (_, i) => {
-          const ratio = i / ticks;
-          const val = maxAbs - ratio * maxAbs * 2;
-          const y = PT + ratio * chartH;
+        <line x1={PL} x2={totalW - PR} y1={midY} y2={midY} stroke="#CBD5E1" strokeWidth="0.5" />
+        {[0, 1, 2].map(i => {
+          const y1 = midY - (chartH / 2 / 2) * (i + 1);
+          const y2 = midY + (chartH / 2 / 2) * (i + 1);
+          const v = (maxAbs / 2) * (i + 1);
           return <g key={i}>
-            <line x1={PL} x2={totalW - PR} y1={y} y2={y} stroke="#F1F5F9" strokeWidth="0.5" />
-            <text x={PL - 4} y={y + 3} textAnchor="end" fontSize="8" fill="#94A3B8">{val.toFixed(1)}%</text>
+            <text x={PL - 3} y={y1 + 3} textAnchor="end" fontSize="7" fill="#94A3B8">{v.toFixed(0)}</text>
+            <text x={PL - 3} y={y2 + 3} textAnchor="end" fontSize="7" fill="#94A3B8">-{v.toFixed(0)}</text>
           </g>;
         })}
-        <line x1={PL} x2={totalW - PR} y1={midY} y2={midY} stroke="#CBD5E1" strokeWidth="0.8" />
-        {/* Bars */}
-        {data.map((v, i) => {
-          const h = maxAbs > 0 ? (Math.abs(v) / maxAbs) * (chartH / 2) : 0;
-          const y = v >= 0 ? midY - h : midY;
-          return <rect key={i} x={PL + i * (bw + 2)} y={y} width={bw} height={h} fill={getColor(v)} rx="1" />;
-        })}
-        {/* X labels */}
-        {data.map((v, i) => {
-          if (data.length <= 12 || i % Math.ceil(data.length / 8) === 0)
-            return <text key={i} x={PL + i * (bw + 2) + bw / 2} y={H - 4} textAnchor="middle" fontSize="7" fill="#94A3B8">{i + 1}</text>;
-          return null;
+        {drmaRanges.map((r, i) => {
+          const x = PL + i * gap;
+          const h = maxAbs > 0 ? (Math.abs(r.drma) / maxAbs) * (chartH / 2) : 0;
+          const y = r.drma >= 0 ? midY - h : midY;
+          return <g key={i}>
+            <rect x={x} y={y} width={bw} height={h} fill={r.drma >= 0 ? "#4F46E5" : "#F87171"} rx="1" />
+            <text x={x + bw / 2} y={H - 6} textAnchor="middle" fontSize="6" fill="#94A3B8" transform={`rotate(-45,${x + bw / 2},${H - 6})`}>{r.label}</text>
+          </g>;
         })}
       </svg>
     );
@@ -3390,45 +3439,14 @@ function TradeStatsView({ tradesIndex, tradeStore, loadTrade, patterns, topPatte
         <div><div style={S.h1}>視覺統計</div><div style={S.sub}>交易表現分佈分析</div></div>
         <button style={S.btnOutline} onClick={onBack}><Icon name="back" size={14} /> 返回</button>
       </div>
-
-      {/* Filters */}
       <div style={{ ...S.card, ...S.flexGap(10), flexWrap: "wrap", padding: 14 }}>
-        <div>
-          <label style={S.label}>期間</label>
-          <select style={{ ...S.select, width: 130 }} value={period} onChange={e => setPeriod(e.target.value)}>
-            <option value="ytd">YTD</option>
-            <option value="1m">近一個月</option>
-            <option value="3m">近三個月</option>
-            <option value="lastMonth">上個月</option>
-            <option value="1y">近一年</option>
-            <option value="custom">自訂</option>
-          </select>
-        </div>
-        {period === "custom" && <>
-          <div><label style={S.label}>起始</label><input type="date" style={{ ...S.input, width: 140 }} value={customFrom} onChange={e => setCustomFrom(e.target.value)} /></div>
-          <div><label style={S.label}>結束</label><input type="date" style={{ ...S.input, width: 140 }} value={customTo} onChange={e => setCustomTo(e.target.value)} /></div>
-        </>}
-        <div>
-          <label style={S.label}>型態分類</label>
-          <select style={{ ...S.select, width: 150 }} value={patFilter} onChange={e => setPatFilter(e.target.value)}>
-            <option value="">全部</option>
-            {patternOptions.map(o => <option key={o.id} value={o.id}>{o.label}</option>)}
-          </select>
-        </div>
-        <div>
-          <label style={S.label}>市場標籤</label>
-          <select style={{ ...S.select, width: 150 }} value={mktFilter} onChange={e => setMktFilter(e.target.value)}>
-            <option value="">全部</option>
-            {allMktTags.map(t => <option key={t} value={t}>{t}</option>)}
-          </select>
-        </div>
+        <div><label style={S.label}>期間</label><select style={{ ...S.select, width: 130 }} value={period} onChange={e => setPeriod(e.target.value)}><option value="ytd">YTD</option><option value="1m">近一個月</option><option value="3m">近三個月</option><option value="lastMonth">上個月</option><option value="1y">近一年</option><option value="custom">自訂</option></select></div>
+        {period === "custom" && <><div><label style={S.label}>起始</label><input type="date" style={{ ...S.input, width: 140 }} value={customFrom} onChange={e => setCustomFrom(e.target.value)} /></div><div><label style={S.label}>結束</label><input type="date" style={{ ...S.input, width: 140 }} value={customTo} onChange={e => setCustomTo(e.target.value)} /></div></>}
+        <div><label style={S.label}>型態分類</label><select style={{ ...S.select, width: 150 }} value={patFilter} onChange={e => setPatFilter(e.target.value)}><option value="">全部</option>{patternOptions.map(o => <option key={o.id} value={o.id}>{o.label}</option>)}</select></div>
+        <div><label style={S.label}>市場標籤</label><select style={{ ...S.select, width: 150 }} value={mktFilter} onChange={e => setMktFilter(e.target.value)}><option value="">全部</option>{allMktTags.map(t => <option key={t} value={t}>{t}</option>)}</select></div>
       </div>
-
-      {totalTrades === 0 ? (
-        <div style={{ ...S.card, textAlign: "center", padding: 36, color: "#94A3B8" }}>該期間無已平倉交易</div>
-      ) : (
+      {totalTrades === 0 ? (<div style={{ ...S.card, textAlign: "center", padding: 36, color: "#94A3B8" }}>該期間無已平倉交易</div>) : (
         <>
-          {/* Summary */}
           <div style={S.card}>
             <div style={S.h3}>Summary</div>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 12, fontSize: 12.5 }}>
@@ -3439,40 +3457,16 @@ function TradeStatsView({ tradesIndex, tradeStore, loadTrade, patterns, topPatte
               <div><span style={{ color: "#94A3B8" }}>Average Loss:</span> <strong style={{ color: "#DC2626" }}>{avgLoss.toFixed(2)}%</strong></div>
               <div><span style={{ color: "#94A3B8" }}># of Losses:</span> <strong>{losses.length}</strong></div>
               <div><span style={{ color: "#94A3B8" }}>Return Per Trade:</span> <strong>{avgReturn.toFixed(2)}%</strong></div>
-              <div><span style={{ color: "#94A3B8" }}>Win/Loss Ratio:</span> <strong>{wlRatio.toFixed(2)}</strong></div>
-              <div><span style={{ color: "#94A3B8" }}>Adjusted Win/Loss Ratio:</span> <strong>{adjWlRatio.toFixed(2)}</strong></div>
+              <div><span style={{ color: "#94A3B8" }}>% Win/Loss Ratio:</span> <strong>{pctRatio.toFixed(2)}</strong></div>
+              <div><span style={{ color: "#94A3B8" }}>Adjusted Win/Loss:</span> <strong>{adjPctRatio.toFixed(2)}</strong></div>
             </div>
           </div>
-
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
-            {/* Gains and Losses */}
-            <div style={S.card}>
-              <div style={S.h3}>Gains and Losses</div>
-              <AxisBarChart data={barData} getColor={v => v >= 0 ? "#34D399" : "#F87171"} />
-            </div>
-
-            {/* DRMA Curve */}
-            <div style={S.card}>
-              <div style={S.h3}>DRMA Curve</div>
-              {drmaData.length >= 1 ? (
-                <AxisBarChart data={drmaData} getColor={v => v >= 0 ? "#4F46E5" : "#F87171"} />
-              ) : <div style={{ color: "#CBD5E1", fontSize: 11 }}>資料不足</div>}
-            </div>
-
-            {/* Gain Magnitude */}
-            <div style={S.card}>
-              <div style={S.h3}>Gain Magnitude</div>
-              <MiniBar values={gainMags} color="#34D399" />
-            </div>
-
-            {/* Loss Magnitude */}
-            <div style={S.card}>
-              <div style={S.h3}>Loss Magnitude</div>
-              <MiniBar values={lossMags} color="#F87171" />
-            </div>
+            <div style={S.card}><div style={S.h3}>Gains and Losses</div><RangeBarChart data={ranges} mode="gl" /></div>
+            <div style={S.card}><div style={S.h3}>DRMA Curve</div><DRMAChart /></div>
+            <div style={S.card}><div style={S.h3}>Gain Magnitude</div><RangeBarChart data={ranges} mode="gains" /></div>
+            <div style={S.card}><div style={S.h3}>Loss Magnitude</div><RangeBarChart data={ranges} mode="losses" /></div>
           </div>
-
-          {/* Range Table */}
           <div style={S.card}>
             <div style={S.h3}>Range Distribution</div>
             <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
