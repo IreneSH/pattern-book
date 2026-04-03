@@ -2800,7 +2800,7 @@ function TradesView({ tradesIndex, tradeStore, loadTrade, patterns, topPatterns,
   const recentClosed = useMemo(() => [...filtered].sort((a, b) => b.closeDate.localeCompare(a.closeDate)).slice(0, 30), [filtered]);
 
   const fmtMoney = (n) => {
-    if (n === undefined || n === null) return "—";
+    if (n === undefined || n === null || isNaN(n)) return "—";
     return (n >= 0 ? "+" : "") + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   };
 
@@ -2916,7 +2916,7 @@ function TradesView({ tradesIndex, tradeStore, loadTrade, patterns, topPatterns,
                   <tr key={t.id} style={{ borderBottom: "1px solid #F1F5F9", cursor: "pointer" }} onClick={() => onOpenTrade(t.id)}>
                     <td style={{ padding: "8px 6px" }}><div style={S.flexGap(6)}>{p && <Dot color={p.color} size={7} />}<span style={{ fontWeight: 600 }}>{t.ticker}</span><span style={{ display: "inline-block", padding: "1px 7px", borderRadius: 4, fontSize: 10, fontWeight: 600, background: (t.type || "long") === "short" ? "#FEE2E2" : "#ECFDF5", color: (t.type || "long") === "short" ? "#DC2626" : "#059669" }}>{(t.type || "long") === "short" ? "Short" : "Long"}</span></div></td>
                     <td style={{ padding: "8px 6px", textAlign: "right", fontWeight: 600, color: t.pnl >= 0 ? "#059669" : "#DC2626" }}>{fmtMoney(t.pnl)}</td>
-                    <td style={{ padding: "8px 6px", textAlign: "right", fontWeight: 600, color: t.pnlPct >= 0 ? "#059669" : "#DC2626" }}>{(t.pnlPct >= 0 ? "+" : "") + t.pnlPct.toFixed(2)}%</td>
+                    <td style={{ padding: "8px 6px", textAlign: "right", fontWeight: 600, color: (t.pnlPct || 0) >= 0 ? "#059669" : "#DC2626" }}>{((t.pnlPct || 0) >= 0 ? "+" : "") + (t.pnlPct || 0).toFixed(2)}%</td>
                     <td style={{ padding: "8px 6px", textAlign: "right", color: "#64748B" }}>{posPct !== null ? posPct.toFixed(1) + "%" : "—"}</td>
                     <td style={{ padding: "8px 6px", textAlign: "right" }}>{t.holdingDays}天</td>
                     <td style={{ padding: "8px 6px" }}>{t.closeDate}</td>
@@ -3100,7 +3100,7 @@ function TradeDetailView({ tradeId, tradeStore, loadTradeFn, setTradeStore, trad
     setMktTagInput(""); setShowSuggestions(false);
   };
 
-  const fmtMoney = (n) => (n >= 0 ? "+" : "") + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const fmtMoney = (n) => { if (n === undefined || n === null || isNaN(n)) return "—"; return (n >= 0 ? "+" : "") + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }); };
   const pat = getPattern(patternId);
   const allClosedTrades = tradesIndex.filter(t => t.status === "closed");
   const posPct = getCapitalAtDate(capitalHistory, allClosedTrades, trade.openDate);
@@ -3133,7 +3133,7 @@ function TradeDetailView({ tradeId, tradeStore, loadTradeFn, setTradeStore, trad
         </div>
         <div style={{ marginTop: 10, display: "grid", gridTemplateColumns: "repeat(6, 1fr)", gap: 8 }}>
           <div style={{ textAlign: "center" }}><div style={{ fontSize: 11, color: "#94A3B8" }}>總損益</div><div style={{ fontSize: 16, fontWeight: 700, color: trade.pnl >= 0 ? "#059669" : "#DC2626" }}>{fmtMoney(trade.pnl)}</div></div>
-          <div style={{ textAlign: "center" }}><div style={{ fontSize: 11, color: "#94A3B8" }}>損益%</div><div style={{ fontSize: 16, fontWeight: 700, color: trade.pnlPct >= 0 ? "#059669" : "#DC2626" }}>{(trade.pnlPct >= 0 ? "+" : "") + trade.pnlPct.toFixed(2)}%</div></div>
+          <div style={{ textAlign: "center" }}><div style={{ fontSize: 11, color: "#94A3B8" }}>損益%</div><div style={{ fontSize: 16, fontWeight: 700, color: (trade.pnlPct || 0) >= 0 ? "#059669" : "#DC2626" }}>{((trade.pnlPct || 0) >= 0 ? "+" : "") + (trade.pnlPct || 0).toFixed(2)}%</div></div>
           <div style={{ textAlign: "center" }}><div style={{ fontSize: 11, color: "#94A3B8" }}>持有天數</div><div style={{ fontSize: 16, fontWeight: 700, color: "#4F46E5" }}>{trade.holdingDays}</div></div>
           <div style={{ textAlign: "center" }}><div style={{ fontSize: 11, color: "#94A3B8" }}>均買價</div><div style={{ fontSize: 16, fontWeight: 700, color: "#334155" }}>${trade.avgBuyPrice}</div></div>
           <div style={{ textAlign: "center" }}><div style={{ fontSize: 11, color: "#94A3B8" }}>部位比重</div><div style={{ fontSize: 16, fontWeight: 700, color: "#7C3AED" }}>{positionSize !== null ? positionSize.toFixed(1) + "%" : "—"}</div></div>
@@ -3159,9 +3159,9 @@ function TradeDetailView({ tradeId, tradeStore, loadTradeFn, setTradeStore, trad
               {localBuys.map((b, i) => (
                 <tr key={i} style={{ borderBottom: "1px solid #F1F5F9" }}>
                   <td style={{ padding: "6px 4px" }}>{b.date}</td>
-                  <td style={{ padding: "6px 4px", textAlign: "right" }}>${b.price.toFixed(2)}</td>
+                  <td style={{ padding: "6px 4px", textAlign: "right" }}>${(b.price || 0).toFixed(2)}</td>
                   <td style={{ padding: "6px 4px", textAlign: "right" }}>{b.quantity}</td>
-                  <td style={{ padding: "6px 4px", textAlign: "right" }}>${b.amount.toFixed(2)}</td>
+                  <td style={{ padding: "6px 4px", textAlign: "right" }}>${(b.amount || 0).toFixed(2)}</td>
                   {editing && <td style={{ padding: "6px 4px", textAlign: "right" }}><button style={{ ...S.btnOutline, padding: "1px 6px", fontSize: 10, color: "#EF4444", borderColor: "#FECACA" }} onClick={() => deleteBuy(i)}>✕</button></td>}
                 </tr>
               ))}
@@ -3194,10 +3194,10 @@ function TradeDetailView({ tradeId, tradeStore, loadTradeFn, setTradeStore, trad
               {localSells.map((s, i) => (
                 <tr key={i} style={{ borderBottom: "1px solid #F1F5F9" }}>
                   <td style={{ padding: "6px 4px" }}>{s.date}</td>
-                  <td style={{ padding: "6px 4px", textAlign: "right" }}>${s.price.toFixed(2)}</td>
+                  <td style={{ padding: "6px 4px", textAlign: "right" }}>${(s.price || 0).toFixed(2)}</td>
                   <td style={{ padding: "6px 4px", textAlign: "right" }}>{s.quantity}</td>
-                  <td style={{ padding: "6px 4px", textAlign: "right", fontWeight: 600, color: s.pnl >= 0 ? "#059669" : "#DC2626" }}>{fmtMoney(s.pnl)}</td>
-                  <td style={{ padding: "6px 4px", textAlign: "right", fontWeight: 600, color: s.pnlPct >= 0 ? "#059669" : "#DC2626" }}>{(s.pnlPct >= 0 ? "+" : "") + s.pnlPct.toFixed(2)}%</td>
+                  <td style={{ padding: "6px 4px", textAlign: "right", fontWeight: 600, color: (s.pnl || 0) >= 0 ? "#059669" : "#DC2626" }}>{fmtMoney(s.pnl)}</td>
+                  <td style={{ padding: "6px 4px", textAlign: "right", fontWeight: 600, color: (s.pnlPct || 0) >= 0 ? "#059669" : "#DC2626" }}>{((s.pnlPct || 0) >= 0 ? "+" : "") + (s.pnlPct || 0).toFixed(2)}%</td>
                   {editing && <td style={{ padding: "6px 4px", textAlign: "right" }}><button style={{ ...S.btnOutline, padding: "1px 6px", fontSize: 10, color: "#EF4444", borderColor: "#FECACA" }} onClick={() => deleteSell(i)}>✕</button></td>}
                 </tr>
               ))}
@@ -3596,7 +3596,7 @@ function CapitalView({ capitalHistory, onSave, showToast, onBack }) {
                       <span style={S.badge(d.type === "deposit" ? "success" : "failure")}>{d.type === "deposit" ? "入金" : "出金"}</span>
                     </td>
                     <td style={{ padding: "10px 8px", textAlign: "right", fontWeight: 600, color: d.type === "deposit" ? "#059669" : "#DC2626" }}>
-                      ${d.amount.toLocaleString()}
+                      ${(d.amount || 0).toLocaleString()}
                     </td>
                     <td style={{ padding: "10px 8px", textAlign: "right", color: "#64748B" }}>${cumNet.toLocaleString()}</td>
                     <td style={{ padding: "10px 8px", textAlign: "right" }}>
