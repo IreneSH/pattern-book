@@ -12,7 +12,7 @@ const fmt = (d) => d ? new Date(d).toLocaleDateString("zh-TW", { year: "numeric"
 const pct = (n, d) => d === 0 ? "—" : Math.round((n / d) * 100) + "%";
 
 const COLORS = ["#7C8CF8","#60A5FA","#34D399","#FBBF24","#F87171","#A78BFA","#F472B6","#38BDF8","#4ADE80","#FB923C"];
-const VIEWS = { DASH:"dash", PATTERNS:"patterns", CASES:"cases", ADD:"add", EDIT:"edit", STATS:"stats", SEARCH:"search", JOURNAL:"journal", JOURNAL_EDIT:"journal_edit", TRADES:"trades", TRADE_DETAIL:"trade_detail", TRADE_STATS:"trade_stats", TRADE_ADD:"trade_add" };
+const VIEWS = { DASH:"dash", PATTERNS:"patterns", CASES:"cases", ADD:"add", EDIT:"edit", STATS:"stats", SEARCH:"search", JOURNAL:"journal", JOURNAL_EDIT:"journal_edit", TRADES:"trades", TRADE_DETAIL:"trade_detail", TRADE_STATS:"trade_stats", TRADE_ADD:"trade_add", CAPITAL:"capital" };
 
 /* ── Firestore Storage Helpers ── */
 async function fsLoadPatterns(uid) {
@@ -766,13 +766,13 @@ function StockDatabook({ userId }) {
     });
   }, [tradeStore, userId]);
 
-  const openTrade = (id) => {
+  const openTrade = async (id) => {
     const t = tradeStore[id];
-    if (t) { setSelectedTrade(t); }
-    else {
-      fsLoadTrade(userId, id).then(loaded => {
-        if (loaded) { setTradeStore(prev => ({ ...prev, [id]: loaded })); setSelectedTrade(loaded); }
-      });
+    if (t) { setSelectedTrade(t); return; }
+    const loaded = await fsLoadTrade(userId, id);
+    if (loaded) {
+      setTradeStore(prev => ({ ...prev, [id]: loaded }));
+      setSelectedTrade(loaded);
     }
   };
 
@@ -860,7 +860,7 @@ function StockDatabook({ userId }) {
             [VIEWS.JOURNAL, "journal", "盤勢日誌"],
             [VIEWS.TRADES, "trade", "交易紀錄"],
           ].map(([v, icon, label]) => (
-            <div key={v} style={S.navItem(view === v || (v === VIEWS.JOURNAL && view === VIEWS.JOURNAL_EDIT) || (v === VIEWS.TRADES && [VIEWS.TRADE_DETAIL, VIEWS.TRADE_STATS, VIEWS.TRADE_ADD].includes(view)))} onClick={() => { setView(v); if (v === VIEWS.CASES) { setSelectedPatternId(null); setSelectedCase(null); } if (v === VIEWS.TRADES) { setSelectedTrade(null); } }}>
+            <div key={v} style={S.navItem(view === v || (v === VIEWS.JOURNAL && view === VIEWS.JOURNAL_EDIT) || (v === VIEWS.TRADES && [VIEWS.TRADE_DETAIL, VIEWS.TRADE_STATS, VIEWS.TRADE_ADD, VIEWS.CAPITAL].includes(view)))} onClick={() => { setView(v); if (v === VIEWS.CASES) { setSelectedPatternId(null); setSelectedCase(null); } if (v === VIEWS.TRADES) { setSelectedTrade(null); } }}>
               <Icon name={icon} size={16} /> {label}
             </div>
           ))}
@@ -880,10 +880,11 @@ function StockDatabook({ userId }) {
         {view === VIEWS.SEARCH && <SearchView casesIndex={casesIndex} caseStore={caseStore} loadCase={loadCaseOnDemand} getPattern={getPattern} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} allMktTags={allMktTags} setLightbox={setLightboxSrc} />}
         {view === VIEWS.JOURNAL && <JournalView journalsIndex={journalsIndex} journalStore={journalStore} loadJournal={loadJournalOnDemand} casesIndex={casesIndex} caseStore={caseStore} loadCase={loadCaseOnDemand} getPattern={getPattern} patterns={patterns} setLightbox={setLightboxSrc} onNew={(date) => { setEditingJournal({ date: date || new Date().toISOString().slice(0,10) }); setView(VIEWS.JOURNAL_EDIT); }} onEdit={(j) => { setEditingJournal(j); setView(VIEWS.JOURNAL_EDIT); }} onDelete={deleteJournalFn} openCase={(id) => { openCase(id); setView(VIEWS.CASES); }} />}
         {view === VIEWS.JOURNAL_EDIT && <JournalForm existing={editingJournal?.blocks ? editingJournal : (editingJournal?.date && journalStore[editingJournal.date]) || null} defaultDate={editingJournal?.date} allMktTags={allMktTags} casesIndex={casesIndex} getPattern={getPattern} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} onSave={(j) => { saveJournalFn(j); showToast("✓ 日誌已儲存"); setView(VIEWS.JOURNAL); }} onCancel={() => setView(VIEWS.JOURNAL)} />}
-        {view === VIEWS.TRADES && <TradesView tradesIndex={tradesIndex} tradeStore={tradeStore} loadTrade={loadTradeOnDemand} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} getPattern={getPattern} allMktTags={allMktTags} capitalHistory={capitalHistory} onSaveCapital={saveCapitalHistory} onImport={importTlg} onOpenTrade={(id) => { openTrade(id); setView(VIEWS.TRADE_DETAIL); }} onGoStats={() => setView(VIEWS.TRADE_STATS)} onGoAdd={() => setView(VIEWS.TRADE_ADD)} showToast={showToast} />}
+        {view === VIEWS.TRADES && <TradesView tradesIndex={tradesIndex} tradeStore={tradeStore} loadTrade={loadTradeOnDemand} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} getPattern={getPattern} allMktTags={allMktTags} capitalHistory={capitalHistory} onImport={importTlg} onOpenTrade={async (id) => { await openTrade(id); setView(VIEWS.TRADE_DETAIL); }} onGoStats={() => setView(VIEWS.TRADE_STATS)} onGoAdd={() => setView(VIEWS.TRADE_ADD)} onGoCapital={() => setView(VIEWS.CAPITAL)} showToast={showToast} />}
         {view === VIEWS.TRADE_DETAIL && <TradeDetailView trade={selectedTrade} tradeStore={tradeStore} tradesIndex={tradesIndex} capitalHistory={capitalHistory} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} getPattern={getPattern} allMktTags={allMktTags} setLightbox={setLightboxSrc} onSave={(t) => { saveTradeFn(t); setSelectedTrade(t); showToast("✓ 已更新"); }} onDelete={() => { if (selectedTrade) { deleteTradeFn(selectedTrade.id); setView(VIEWS.TRADES); } }} onBack={() => setView(VIEWS.TRADES)} />}
         {view === VIEWS.TRADE_STATS && <TradeStatsView tradesIndex={tradesIndex} tradeStore={tradeStore} loadTrade={loadTradeOnDemand} patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} getPattern={getPattern} allMktTags={allMktTags} onBack={() => setView(VIEWS.TRADES)} />}
         {view === VIEWS.TRADE_ADD && <TradeForm patterns={patterns} topPatterns={topPatterns} getChildren={getChildren} allMktTags={allMktTags} onSave={(t) => { saveTradeFn(t); showToast("✓ 新增成功"); setView(VIEWS.TRADES); }} onCancel={() => setView(VIEWS.TRADES)} />}
+        {view === VIEWS.CAPITAL && <CapitalView capitalHistory={capitalHistory} onSave={saveCapitalHistory} showToast={showToast} onBack={() => setView(VIEWS.TRADES)} />}
       </div>
 
       {patternModal && <PatternModal existing={patternModal.mode === "edit" ? patternModal.pattern : null} parentId={patternModal.parentId || null} patterns={patterns} topPatterns={topPatterns} onSave={savePatternFn} onClose={() => setPatternModal(null)} />}
@@ -2658,14 +2659,12 @@ function JournalForm({ existing, defaultDate, allMktTags, casesIndex, getPattern
 /* ══════════════════════════════════════════════════════════════
    TRADES VIEW — Dashboard
    ══════════════════════════════════════════════════════════════ */
-function TradesView({ tradesIndex, tradeStore, loadTrade, patterns, topPatterns, getChildren, getPattern, allMktTags, capitalHistory, onSaveCapital, onImport, onOpenTrade, onGoStats, onGoAdd, showToast }) {
+function TradesView({ tradesIndex, tradeStore, loadTrade, patterns, topPatterns, getChildren, getPattern, allMktTags, capitalHistory, onImport, onOpenTrade, onGoStats, onGoAdd, onGoCapital, showToast }) {
   const [period, setPeriod] = useState("ytd");
   const [customFrom, setCustomFrom] = useState("");
   const [customTo, setCustomTo] = useState("");
   const [patFilter, setPatFilter] = useState("");
   const [mktFilter, setMktFilter] = useState("");
-  const [showCapital, setShowCapital] = useState(false);
-  const [newDeposit, setNewDeposit] = useState({ date: new Date().toISOString().slice(0, 10), amount: "", type: "deposit" });
   const fileRef = useRef();
 
   const patternOptions = useMemo(() => {
@@ -2797,19 +2796,6 @@ function TradesView({ tradesIndex, tradeStore, loadTrade, patterns, topPatterns,
     e.target.value = "";
   };
 
-  const addDeposit = () => {
-    if (!newDeposit.amount || !newDeposit.date) return;
-    const item = { date: newDeposit.date, amount: parseFloat(newDeposit.amount), type: newDeposit.type, id: genId() };
-    onSaveCapital([...capitalHistory, item]);
-    setNewDeposit({ date: new Date().toISOString().slice(0, 10), amount: "", type: "deposit" });
-    showToast("已新增資金紀錄");
-  };
-
-  const deleteDeposit = (id) => {
-    onSaveCapital(capitalHistory.filter(d => d.id !== id));
-    showToast("已刪除");
-  };
-
   const recentClosed = useMemo(() => [...filtered].sort((a, b) => b.closeDate.localeCompare(a.closeDate)).slice(0, 30), [filtered]);
 
   const fmtMoney = (n) => {
@@ -2822,52 +2808,13 @@ function TradesView({ tradesIndex, tradeStore, loadTrade, patterns, topPatterns,
       <div style={S.flexBetween}>
         <div><div style={S.h1}>交易紀錄</div><div style={S.sub}>追蹤你的交易表現</div></div>
         <div style={S.flexGap(8)}>
-          <button style={S.btnOutline} onClick={() => setShowCapital(!showCapital)}>💰 資金管理</button>
+          <button style={S.btnOutline} onClick={onGoCapital}>💰 資金管理</button>
           <button style={S.btnOutline} onClick={onGoStats}>📊 視覺統計</button>
           <button style={S.btnOutline} onClick={onGoAdd}>✏️ 手動新增</button>
           <button style={S.btn()} onClick={() => fileRef.current?.click()}>📁 匯入 TLG</button>
           <input ref={fileRef} type="file" accept=".tlg" style={{ display: "none" }} onChange={handleFileUpload} />
         </div>
       </div>
-
-      {/* Capital Management */}
-      {showCapital && (
-        <div style={S.card}>
-          <div style={S.h3}>💰 入金 / 出金紀錄</div>
-          <div style={{ fontSize: 11, color: "#94A3B8", marginBottom: 10 }}>記錄帳戶入金與出金，用於計算報酬率 (TWRR) 和部位比重</div>
-          <div style={{ ...S.flexGap(8), marginBottom: 10 }}>
-            <input type="date" style={{ ...S.input, width: 140 }} value={newDeposit.date} onChange={e => setNewDeposit(p => ({ ...p, date: e.target.value }))} />
-            <select style={{ ...S.select, width: 100 }} value={newDeposit.type} onChange={e => setNewDeposit(p => ({ ...p, type: e.target.value }))}>
-              <option value="deposit">入金</option>
-              <option value="withdrawal">出金</option>
-            </select>
-            <input type="number" style={{ ...S.input, width: 150 }} value={newDeposit.amount} onChange={e => setNewDeposit(p => ({ ...p, amount: e.target.value }))} placeholder="金額" />
-            <button style={S.btn()} onClick={addDeposit}>新增</button>
-          </div>
-          {capitalHistory.length > 0 && (
-            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
-              <thead><tr style={{ borderBottom: "1px solid #E2E8F0" }}>
-                <th style={{ textAlign: "left", padding: "6px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>日期</th>
-                <th style={{ textAlign: "left", padding: "6px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>類型</th>
-                <th style={{ textAlign: "right", padding: "6px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>金額</th>
-                <th style={{ padding: "6px" }}></th>
-              </tr></thead>
-              <tbody>
-                {capitalHistory.map(d => (
-                  <tr key={d.id || d.date} style={{ borderBottom: "1px solid #F1F5F9" }}>
-                    <td style={{ padding: "6px" }}>{d.date}</td>
-                    <td style={{ padding: "6px", color: d.type === "deposit" ? "#059669" : "#DC2626" }}>{d.type === "deposit" ? "入金" : "出金"}</td>
-                    <td style={{ padding: "6px", textAlign: "right" }}>${d.amount.toLocaleString()}</td>
-                    <td style={{ padding: "6px", textAlign: "right" }}>
-                      <button style={{ ...S.btnOutline, padding: "2px 8px", fontSize: 10, color: "#EF4444", borderColor: "#FECACA" }} onClick={() => deleteDeposit(d.id)}>刪除</button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-        </div>
-      )}
 
       {/* Filter bar */}
       <div style={{ ...S.card, ...S.flexGap(10), flexWrap: "wrap", padding: 14 }}>
@@ -2929,7 +2876,7 @@ function TradesView({ tradesIndex, tradeStore, loadTrade, patterns, topPatterns,
             <tbody>
               {openTrades.map(t => (
                 <tr key={t.id} style={{ borderBottom: "1px solid #F1F5F9", cursor: "pointer" }} onClick={() => onOpenTrade(t.id)}>
-                  <td style={{ padding: "8px 6px", fontWeight: 600 }}>{t.ticker}</td>
+                  <td style={{ padding: "8px 6px" }}><div style={S.flexGap(6)}><span style={{ fontWeight: 600 }}>{t.ticker}</span><span style={{ display: "inline-block", padding: "1px 7px", borderRadius: 4, fontSize: 10, fontWeight: 600, background: (t.type || "long") === "short" ? "#FEE2E2" : "#ECFDF5", color: (t.type || "long") === "short" ? "#DC2626" : "#059669" }}>{(t.type || "long") === "short" ? "Short" : "Long"}</span></div></td>
                   <td style={{ padding: "8px 6px", textAlign: "right" }}>${t.avgBuyPrice}</td>
                   <td style={{ padding: "8px 6px", textAlign: "right" }}>{t.remainingQty}</td>
                   <td style={{ padding: "8px 6px" }}>{t.openDate}</td>
@@ -2966,7 +2913,7 @@ function TradesView({ tradesIndex, tradeStore, loadTrade, patterns, topPatterns,
                 const posPct = getPositionSize(t);
                 return (
                   <tr key={t.id} style={{ borderBottom: "1px solid #F1F5F9", cursor: "pointer" }} onClick={() => onOpenTrade(t.id)}>
-                    <td style={{ padding: "8px 6px" }}><div style={S.flexGap(6)}>{p && <Dot color={p.color} size={7} />}<span style={{ fontWeight: 600 }}>{t.ticker}</span></div></td>
+                    <td style={{ padding: "8px 6px" }}><div style={S.flexGap(6)}>{p && <Dot color={p.color} size={7} />}<span style={{ fontWeight: 600 }}>{t.ticker}</span><span style={{ display: "inline-block", padding: "1px 7px", borderRadius: 4, fontSize: 10, fontWeight: 600, background: (t.type || "long") === "short" ? "#FEE2E2" : "#ECFDF5", color: (t.type || "long") === "short" ? "#DC2626" : "#059669" }}>{(t.type || "long") === "short" ? "Short" : "Long"}</span></div></td>
                     <td style={{ padding: "8px 6px", textAlign: "right", fontWeight: 600, color: t.pnl >= 0 ? "#059669" : "#DC2626" }}>{fmtMoney(t.pnl)}</td>
                     <td style={{ padding: "8px 6px", textAlign: "right", fontWeight: 600, color: t.pnlPct >= 0 ? "#059669" : "#DC2626" }}>{(t.pnlPct >= 0 ? "+" : "") + t.pnlPct.toFixed(2)}%</td>
                     <td style={{ padding: "8px 6px", textAlign: "right", color: "#64748B" }}>{posPct !== null ? posPct.toFixed(1) + "%" : "—"}</td>
@@ -3345,46 +3292,56 @@ function TradeStatsView({ tradesIndex, tradeStore, loadTrade, patterns, topPatte
     return buckets;
   }, [closed]);
 
-  // Chart: X = % ranges, Y = count of trades
-  const RangeBarChart = ({ data, title, mode }) => {
-    // mode: "gl" for gains & losses side by side, "magnitude" for single color, "drma" for net
-    const maxCount = Math.max(...data.map(d => mode === "gl" ? Math.max(d.gains, d.losses) : (d.gains + d.losses)), 1);
-    const PL = 30, PR = 10, PT = 10, PB = 30;
-    const bw = mode === "gl" ? 10 : 16;
-    const gap = mode === "gl" ? 22 : 20;
-    const totalW = PL + PR + data.length * gap;
-    const chartH = 80;
-    const H = chartH + PT + PB;
-    const ticks = 4;
-    const hasData = data.some(d => d.gains > 0 || d.losses > 0);
-    if (!hasData) return <div style={{ color: "#CBD5E1", fontSize: 11 }}>無資料</div>;
+  // Combined G&L distribution: losses shown as negative ranges on left, gains on right
+  const glDistribution = useMemo(() => {
+    // Find max range that has data
+    let maxIdx = 0;
+    ranges.forEach((r, i) => { if (r.gains > 0 || r.losses > 0) maxIdx = i; });
+    const usedRanges = ranges.slice(0, maxIdx + 1);
+    // Build: [...losses reversed (negative labels), ...gains (positive labels)]
+    const bars = [];
+    // Losses: reversed so largest negative is on far left
+    const lossRanges = usedRanges.filter(r => r.losses > 0).reverse();
+    // Also include zero-count loss ranges for continuity up to max loss range
+    let maxLossIdx = 0;
+    usedRanges.forEach((r, i) => { if (r.losses > 0) maxLossIdx = i; });
+    for (let i = maxLossIdx; i >= 0; i--) {
+      const r = usedRanges[i];
+      bars.push({ label: `-${r.min}-${r.max}%`, count: r.losses, color: "#F87171" });
+    }
+    // Gains
+    for (let i = 0; i <= maxIdx; i++) {
+      const r = usedRanges[i];
+      bars.push({ label: `${r.min}-${r.max}%`, count: r.gains, color: "#86EFAC" });
+    }
+    return bars;
+  }, [ranges]);
+
+  // Simple bar chart: X = labels, Y = count
+  const SimpleBarChart = ({ bars, height = 140 }) => {
+    if (!bars || bars.length === 0) return <div style={{ color: "#CBD5E1", fontSize: 11 }}>無資料</div>;
+    const maxVal = Math.max(...bars.map(b => b.count), 1);
+    const PL = 28, PR = 8, PT = 12, PB = 40;
+    const bw = Math.max(14, Math.min(28, 500 / bars.length));
+    const gap = bw + 4;
+    const totalW = PL + PR + bars.length * gap;
+    const chartH = height - PT - PB;
+    const ticks = Math.min(maxVal, 5);
 
     return (
-      <svg viewBox={`0 0 ${totalW} ${H}`} style={{ width: "100%", height: H }}>
+      <svg viewBox={`0 0 ${totalW} ${height}`} style={{ width: "100%", height }}>
         {Array.from({ length: ticks + 1 }, (_, i) => {
-          const val = maxCount - (maxCount / ticks) * i;
+          const val = maxVal - (maxVal / ticks) * i;
           const y = PT + (chartH / ticks) * i;
-          return <g key={i}><line x1={PL} x2={totalW - PR} y1={y} y2={y} stroke="#F1F5F9" strokeWidth="0.5" /><text x={PL - 3} y={y + 3} textAnchor="end" fontSize="7" fill="#94A3B8">{Math.round(val)}</text></g>;
+          return <g key={i}><line x1={PL} x2={totalW - PR} y1={y} y2={y} stroke="#F1F5F9" strokeWidth="0.5" /><text x={PL - 4} y={y + 3} textAnchor="end" fontSize="9" fill="#94A3B8">{Math.round(val)}</text></g>;
         })}
-        {data.map((d, i) => {
+        {bars.map((b, i) => {
           const x = PL + i * gap;
-          if (mode === "gl") {
-            const hG = maxCount > 0 ? (d.gains / maxCount) * chartH : 0;
-            const hL = maxCount > 0 ? (d.losses / maxCount) * chartH : 0;
-            return <g key={i}>
-              <rect x={x} y={PT + chartH - hG} width={bw - 1} height={hG} fill="#34D399" rx="1" />
-              <rect x={x + bw} y={PT + chartH - hL} width={bw - 1} height={hL} fill="#F87171" rx="1" />
-              <text x={x + bw} y={H - 6} textAnchor="middle" fontSize="6" fill="#94A3B8" transform={`rotate(-45,${x + bw},${H - 6})`}>{d.label}</text>
-            </g>;
-          } else {
-            const count = mode === "gains" ? d.gains : mode === "losses" ? d.losses : d.gains + d.losses;
-            const h = maxCount > 0 ? (count / maxCount) * chartH : 0;
-            const color = mode === "gains" ? "#34D399" : mode === "losses" ? "#F87171" : "#4F46E5";
-            return <g key={i}>
-              <rect x={x} y={PT + chartH - h} width={bw} height={h} fill={color} rx="1" />
-              <text x={x + bw / 2} y={H - 6} textAnchor="middle" fontSize="6" fill="#94A3B8" transform={`rotate(-45,${x + bw / 2},${H - 6})`}>{d.label}</text>
-            </g>;
-          }
+          const h = maxVal > 0 ? (b.count / maxVal) * chartH : 0;
+          return <g key={i}>
+            {h > 0 && <rect x={x} y={PT + chartH - h} width={bw} height={h} fill={b.color} rx="2" />}
+            <text x={x + bw / 2} y={height - 4} textAnchor="end" fontSize="8" fill="#94A3B8" transform={`rotate(-45,${x + bw / 2},${height - 4})`}>{b.label}</text>
+          </g>;
         })}
       </svg>
     );
@@ -3398,40 +3355,53 @@ function TradeStatsView({ tradesIndex, tradeStore, loadTrade, patterns, topPatte
   });
 
   const DRMAChart = () => {
-    const vals = drmaRanges.map(r => r.drma);
+    const usedRanges = drmaRanges.filter((r, i) => i <= Math.max(...drmaRanges.map((rr, j) => (rr.gains > 0 || rr.losses > 0) ? j : 0)));
+    const vals = usedRanges.map(r => r.drma);
     const maxAbs = Math.max(...vals.map(Math.abs), 0.01);
-    const PL = 30, PR = 10, PT = 10, PB = 30;
-    const gap = 20, bw = 16;
-    const totalW = PL + PR + drmaRanges.length * gap;
-    const chartH = 80, H = chartH + PT + PB;
+    const PL = 32, PR = 8, PT = 12, PB = 40;
+    const bw = Math.max(14, Math.min(28, 500 / usedRanges.length));
+    const gap = bw + 4;
+    const totalW = PL + PR + usedRanges.length * gap;
+    const chartH = 100, H = chartH + PT + PB;
     const midY = PT + chartH / 2;
     const hasData = vals.some(v => v !== 0);
     if (!hasData) return <div style={{ color: "#CBD5E1", fontSize: 11 }}>無資料</div>;
+    const ticks = 4;
 
     return (
       <svg viewBox={`0 0 ${totalW} ${H}`} style={{ width: "100%", height: H }}>
-        <line x1={PL} x2={totalW - PR} y1={midY} y2={midY} stroke="#CBD5E1" strokeWidth="0.5" />
-        {[0, 1, 2].map(i => {
-          const y1 = midY - (chartH / 2 / 2) * (i + 1);
-          const y2 = midY + (chartH / 2 / 2) * (i + 1);
-          const v = (maxAbs / 2) * (i + 1);
+        {Array.from({ length: ticks + 1 }, (_, i) => {
+          const ratio = i / ticks;
+          const val = maxAbs - ratio * maxAbs * 2;
+          const y = PT + ratio * chartH;
           return <g key={i}>
-            <text x={PL - 3} y={y1 + 3} textAnchor="end" fontSize="7" fill="#94A3B8">{v.toFixed(0)}</text>
-            <text x={PL - 3} y={y2 + 3} textAnchor="end" fontSize="7" fill="#94A3B8">-{v.toFixed(0)}</text>
+            <line x1={PL} x2={totalW - PR} y1={y} y2={y} stroke="#F1F5F9" strokeWidth="0.5" />
+            <text x={PL - 4} y={y + 3} textAnchor="end" fontSize="9" fill="#94A3B8">{val.toFixed(0)}</text>
           </g>;
         })}
-        {drmaRanges.map((r, i) => {
+        <line x1={PL} x2={totalW - PR} y1={midY} y2={midY} stroke="#CBD5E1" strokeWidth="0.8" />
+        {usedRanges.map((r, i) => {
           const x = PL + i * gap;
           const h = maxAbs > 0 ? (Math.abs(r.drma) / maxAbs) * (chartH / 2) : 0;
           const y = r.drma >= 0 ? midY - h : midY;
           return <g key={i}>
-            <rect x={x} y={y} width={bw} height={h} fill={r.drma >= 0 ? "#4F46E5" : "#F87171"} rx="1" />
-            <text x={x + bw / 2} y={H - 6} textAnchor="middle" fontSize="6" fill="#94A3B8" transform={`rotate(-45,${x + bw / 2},${H - 6})`}>{r.label}</text>
+            <rect x={x} y={y} width={bw} height={h} fill={r.drma >= 0 ? "#4F46E5" : "#F87171"} rx="2" />
+            <text x={x + bw / 2} y={H - 4} textAnchor="end" fontSize="8" fill="#94A3B8" transform={`rotate(-45,${x + bw / 2},${H - 4})`}>{r.label}</text>
           </g>;
         })}
       </svg>
     );
   };
+
+  // Magnitude charts data
+  const gainBars = useMemo(() => {
+    const used = ranges.filter(r => r.gains > 0);
+    return used.map(r => ({ label: `${r.min}-${r.max}%`, count: r.gains, color: "#86EFAC" }));
+  }, [ranges]);
+  const lossBars = useMemo(() => {
+    const used = ranges.filter(r => r.losses > 0);
+    return used.map(r => ({ label: `${r.min}-${r.max}%`, count: r.losses, color: "#FCA5A5" }));
+  }, [ranges]);
 
   return (
     <div>
@@ -3462,10 +3432,10 @@ function TradeStatsView({ tradesIndex, tradeStore, loadTrade, patterns, topPatte
             </div>
           </div>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
-            <div style={S.card}><div style={S.h3}>Gains and Losses</div><RangeBarChart data={ranges} mode="gl" /></div>
+            <div style={S.card}><div style={S.h3}>Gains and Losses</div><SimpleBarChart bars={glDistribution} height={160} /></div>
             <div style={S.card}><div style={S.h3}>DRMA Curve</div><DRMAChart /></div>
-            <div style={S.card}><div style={S.h3}>Gain Magnitude</div><RangeBarChart data={ranges} mode="gains" /></div>
-            <div style={S.card}><div style={S.h3}>Loss Magnitude</div><RangeBarChart data={ranges} mode="losses" /></div>
+            <div style={S.card}><div style={S.h3}>Gain Magnitude</div><SimpleBarChart bars={gainBars} height={140} /></div>
+            <div style={S.card}><div style={S.h3}>Loss Magnitude</div><SimpleBarChart bars={lossBars} height={140} /></div>
           </div>
           <div style={S.card}>
             <div style={S.h3}>Range Distribution</div>
@@ -3512,6 +3482,107 @@ function TradeStatsView({ tradesIndex, tradeStore, loadTrade, patterns, topPatte
           </div>
         </>
       )}
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════
+   CAPITAL VIEW — Deposit/Withdrawal Management
+   ══════════════════════════════════════════════════════════════ */
+function CapitalView({ capitalHistory, onSave, showToast, onBack }) {
+  const [newItem, setNewItem] = useState({ date: new Date().toISOString().slice(0, 10), amount: "", type: "deposit" });
+
+  const addItem = () => {
+    if (!newItem.amount || !newItem.date) return;
+    const item = { date: newItem.date, amount: parseFloat(newItem.amount), type: newItem.type, id: genId() };
+    onSave([...capitalHistory, item]);
+    setNewItem({ date: new Date().toISOString().slice(0, 10), amount: "", type: "deposit" });
+    showToast("已新增資金紀錄");
+  };
+
+  const deleteItem = (id) => {
+    if (!confirm("確定刪除？")) return;
+    onSave(capitalHistory.filter(d => d.id !== id));
+    showToast("已刪除");
+  };
+
+  const totalDeposits = capitalHistory.filter(d => d.type === "deposit").reduce((s, d) => s + d.amount, 0);
+  const totalWithdrawals = capitalHistory.filter(d => d.type === "withdrawal").reduce((s, d) => s + d.amount, 0);
+  const netCapital = totalDeposits - totalWithdrawals;
+
+  return (
+    <div>
+      <div style={S.flexBetween}>
+        <div><div style={S.h1}>💰 資金管理</div><div style={S.sub}>記錄帳戶入金與出金，用於計算報酬率 (TWRR) 和部位比重</div></div>
+        <button style={S.btnOutline} onClick={onBack}><Icon name="back" size={14} /> 返回交易紀錄</button>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12, marginBottom: 16 }}>
+        <StatCard label="總入金" value={"$" + totalDeposits.toLocaleString()} color="#059669" />
+        <StatCard label="總出金" value={"$" + totalWithdrawals.toLocaleString()} color="#DC2626" />
+        <StatCard label="淨入金" value={"$" + netCapital.toLocaleString()} color="#4F46E5" />
+      </div>
+
+      <div style={S.card}>
+        <div style={S.h3}>新增紀錄</div>
+        <div style={{ ...S.flexGap(10), marginBottom: 16 }}>
+          <div>
+            <label style={S.label}>日期</label>
+            <input type="date" style={{ ...S.input, width: 160 }} value={newItem.date} onChange={e => setNewItem(p => ({ ...p, date: e.target.value }))} />
+          </div>
+          <div>
+            <label style={S.label}>類型</label>
+            <select style={{ ...S.select, width: 110 }} value={newItem.type} onChange={e => setNewItem(p => ({ ...p, type: e.target.value }))}>
+              <option value="deposit">入金</option>
+              <option value="withdrawal">出金</option>
+            </select>
+          </div>
+          <div>
+            <label style={S.label}>金額 (USD)</label>
+            <input type="number" style={{ ...S.input, width: 180 }} value={newItem.amount} onChange={e => setNewItem(p => ({ ...p, amount: e.target.value }))} placeholder="輸入金額" />
+          </div>
+          <div style={{ alignSelf: "flex-end" }}>
+            <button style={S.btn()} onClick={addItem}>儲存</button>
+          </div>
+        </div>
+      </div>
+
+      <div style={S.card}>
+        <div style={S.h3}>歷史紀錄 ({capitalHistory.length} 筆)</div>
+        {capitalHistory.length === 0 ? (
+          <div style={{ color: "#CBD5E1", fontSize: 12, textAlign: "center", padding: 20 }}>尚無入金/出金紀錄</div>
+        ) : (
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+            <thead><tr style={{ borderBottom: "2px solid #E2E8F0" }}>
+              <th style={{ textAlign: "left", padding: "10px 8px", color: "#94A3B8", fontWeight: 600, fontSize: 11 }}>日期</th>
+              <th style={{ textAlign: "left", padding: "10px 8px", color: "#94A3B8", fontWeight: 600, fontSize: 11 }}>類型</th>
+              <th style={{ textAlign: "right", padding: "10px 8px", color: "#94A3B8", fontWeight: 600, fontSize: 11 }}>金額</th>
+              <th style={{ textAlign: "right", padding: "10px 8px", color: "#94A3B8", fontWeight: 600, fontSize: 11 }}>累計淨入金</th>
+              <th style={{ padding: "10px 8px" }}></th>
+            </tr></thead>
+            <tbody>
+              {capitalHistory.map((d, idx) => {
+                const cumNet = capitalHistory.slice(0, idx + 1).reduce((s, x) => s + (x.type === "deposit" ? x.amount : -x.amount), 0);
+                return (
+                  <tr key={d.id || idx} style={{ borderBottom: "1px solid #F1F5F9" }}>
+                    <td style={{ padding: "10px 8px" }}>{d.date}</td>
+                    <td style={{ padding: "10px 8px" }}>
+                      <span style={S.badge(d.type === "deposit" ? "success" : "failure")}>{d.type === "deposit" ? "入金" : "出金"}</span>
+                    </td>
+                    <td style={{ padding: "10px 8px", textAlign: "right", fontWeight: 600, color: d.type === "deposit" ? "#059669" : "#DC2626" }}>
+                      ${d.amount.toLocaleString()}
+                    </td>
+                    <td style={{ padding: "10px 8px", textAlign: "right", color: "#64748B" }}>${cumNet.toLocaleString()}</td>
+                    <td style={{ padding: "10px 8px", textAlign: "right" }}>
+                      <button style={{ ...S.btnOutline, padding: "4px 10px", fontSize: 11, color: "#EF4444", borderColor: "#FECACA" }} onClick={() => deleteItem(d.id)}>刪除</button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
     </div>
   );
 }
