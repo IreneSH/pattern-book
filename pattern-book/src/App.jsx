@@ -3244,7 +3244,7 @@ function TradeDetailView({ tradeId, tradeStore, loadTradeFn, setTradeStore, trad
             </div>
           </div>
         </div>
-          <div style={{ ...S.flexGap(8), justifyContent: "flex-end", marginTop: 14 }}>
+          <div style={{ ...S.flexGap(8), justifyContent: "flex-end", marginTop: 14, paddingBottom: 40 }}>
             <button style={S.btnOutline} onClick={() => { setEditing(false); setLocalBuys(trade.buys || []); setLocalSells(trade.sells || []); }}>取消</button>
             <button style={S.btn()} onClick={handleSave}>儲存</button>
           </div>
