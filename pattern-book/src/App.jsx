@@ -3215,7 +3215,8 @@ function TradeDetailView({ tradeId, tradeStore, loadTradeFn, setTradeStore, trad
       </div>
 
       {editing && (
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+        <div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
           <div>
             <div style={S.card}><div style={S.h3}>型態分類</div><select style={S.select} value={patternId} onChange={e => setPatternId(e.target.value)}><option value="">未分類</option>{patternOptions.map(o => <option key={o.id} value={o.id}>{o.label}</option>)}</select></div>
             <div style={S.card}>
@@ -3241,10 +3242,11 @@ function TradeDetailView({ tradeId, tradeStore, loadTradeFn, setTradeStore, trad
               {images.map((img, i) => (<div key={i} style={{ position: "relative", marginBottom: 10 }}><img src={img} alt="" style={{ ...S.img, maxHeight: 240 }} onClick={() => setLightbox(img)} /><button onClick={() => setImages(prev => prev.filter((_, j) => j !== i))} style={{ position: "absolute", top: 6, right: 6, background: "rgba(0,0,0,0.5)", color: "#FFF", border: "none", borderRadius: "50%", width: 26, height: 26, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}><Icon name="x" size={13} /></button></div>))}
               {images.length < 2 && (<div onClick={() => fileRef.current?.click()} style={{ border: "2px dashed #D1D5DB", borderRadius: 8, padding: 28, textAlign: "center", cursor: "pointer", color: "#94A3B8" }}><Icon name="img" size={28} /><div style={{ marginTop: 6, fontSize: 12.5, fontWeight: 500 }}>點擊上傳圖片</div><input ref={fileRef} type="file" accept="image/*" style={{ display: "none" }} onChange={handleImage} /></div>)}
             </div>
-            <div style={{ ...S.flexGap(8), justifyContent: "flex-end", marginTop: 10 }}>
-              <button style={S.btnOutline} onClick={() => { setEditing(false); setLocalBuys(trade.buys || []); setLocalSells(trade.sells || []); }}>取消</button>
-              <button style={S.btn()} onClick={handleSave}>儲存</button>
-            </div>
+          </div>
+        </div>
+          <div style={{ ...S.flexGap(8), justifyContent: "flex-end", marginTop: 14 }}>
+            <button style={S.btnOutline} onClick={() => { setEditing(false); setLocalBuys(trade.buys || []); setLocalSells(trade.sells || []); }}>取消</button>
+            <button style={S.btn()} onClick={handleSave}>儲存</button>
           </div>
         </div>
       )}
