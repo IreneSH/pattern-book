@@ -70,6 +70,14 @@ async function fsLoadCapitalHistory(uid) {
 async function fsSaveCapitalHistory(uid, items) {
   try { await setDoc(doc(db, "users", uid, "data", "capitalHistory"), { items }); } catch(e) { console.error("save capital err", e); }
 }
+async function fetchStockPrice(ticker) {
+  try {
+    const res = await fetch(`/.netlify/functions/quote?ticker=${encodeURIComponent(ticker)}`);
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data?.snapshot || null;
+  } catch(e) { console.error("fetch price err", ticker, e); return null; }
+}
 async function fsSaveTrade(uid, t) {
   try { await setDoc(doc(db, "users", uid, "trades", t.id), t); } catch(e) { console.error("save trade err", e); }
 }
@@ -786,54 +794,119 @@ function StockDatabook({ userId }) {
   const importTlg = (text) => {
     const txns = parseTlg(text);
     if (txns.length === 0) { showToast("未找到交易紀錄"); return 0; }
-    const newTrades = buildTradesFromTxns(txns);
-    // Deduplicate by checking existing trade IDs' buy/sell tradeIds
-    const existingTradeIds = new Set();
+
+    // Collect all existing transaction IDs for dedup
+    const existingTxnIds = new Set();
     tradesIndex.forEach(t => {
       const full = tradeStore[t.id];
       if (full) {
-        (full.buys || []).forEach(b => existingTradeIds.add(b.tradeId));
-        (full.sells || []).forEach(s => existingTradeIds.add(s.tradeId));
+        (full.buys || []).forEach(b => existingTxnIds.add(b.tradeId));
+        (full.sells || []).forEach(s => existingTxnIds.add(s.tradeId));
       }
     });
 
-    const toImport = [];
-    newTrades.forEach(trade => {
-      const allTxnIds = [...trade.buys.map(b => b.tradeId), ...trade.sells.map(s => s.tradeId)];
-      const hasExisting = allTxnIds.some(id => existingTradeIds.has(id));
-      if (!hasExisting) {
-        toImport.push(trade);
-        allTxnIds.forEach(id => existingTradeIds.add(id));
+    // Filter out already-imported transactions
+    const newTxns = txns.filter(t => !existingTxnIds.has(t.tradeId));
+    if (newTxns.length === 0) return 0;
+
+    // Phase 1: Try to merge into existing open positions
+    const unmatchedTxns = [];
+    const updatedTrades = {}; // id -> updated trade
+
+    newTxns.forEach(txn => {
+      // Find existing open position with same ticker
+      const openIdx = tradesIndex.find(t =>
+        t.status === "open" && t.ticker === txn.ticker && !updatedTrades[t.id]?.merged
+      );
+      // Also check trades we've already started updating in this batch
+      const openEntry = openIdx || Object.values(updatedTrades).find(u =>
+        u.trade.status === "open" && u.trade.ticker === txn.ticker
+      );
+
+      if (openEntry) {
+        const tradeId = openIdx ? openIdx.id : openEntry.trade.id;
+        if (!updatedTrades[tradeId]) {
+          const full = tradeStore[tradeId];
+          if (!full) { unmatchedTxns.push(txn); return; }
+          updatedTrades[tradeId] = { trade: JSON.parse(JSON.stringify(full)), merged: false };
+        }
+        const ut = updatedTrades[tradeId];
+        const fmtDate = fmtTlgDate(txn.date);
+
+        if (txn.action === "BUYTOOPEN") {
+          ut.trade.buys.push({
+            tradeId: txn.tradeId, date: fmtDate, time: txn.time,
+            price: txn.price, quantity: txn.quantity,
+            amount: Math.abs(txn.amount), commission: txn.commission, exchange: txn.exchange,
+          });
+        } else if (txn.action === "SELLTOCLOSE") {
+          // FIFO cost basis from all buys minus already sold
+          const fifoLots = ut.trade.buys.map(b => ({ price: b.price, qty: b.quantity }));
+          const soldBefore = ut.trade.sells.reduce((s, s2) => s + s2.quantity, 0);
+          let skip = soldBefore;
+          for (const lot of fifoLots) { const c = Math.min(skip, lot.qty); lot.qty -= c; skip -= c; }
+          let rem = txn.quantity, costBasis = 0;
+          for (const lot of fifoLots) {
+            if (rem <= 0) break;
+            const c = Math.min(rem, lot.qty);
+            costBasis += c * lot.price;
+            lot.qty -= c;
+            rem -= c;
+          }
+          const grossPnl = txn.quantity * txn.price - costBasis;
+          const pnlPctVal = costBasis > 0 ? (grossPnl / costBasis) * 100 : 0;
+
+          ut.trade.sells.push({
+            tradeId: txn.tradeId, date: fmtDate, time: txn.time,
+            price: txn.price, quantity: txn.quantity,
+            amount: Math.abs(txn.amount), commission: txn.commission, exchange: txn.exchange,
+            pnl: Math.round(grossPnl * 100) / 100, pnlPct: Math.round(pnlPctVal * 100) / 100,
+          });
+        }
+        ut.merged = true;
+      } else {
+        unmatchedTxns.push(txn);
       }
     });
 
-    if (toImport.length === 0) return 0;
-
-    // Batch update state
-    const newIndexEntries = toImport.map(t => ({
-      id: t.id, ticker: t.ticker, name: t.name, currency: t.currency, status: t.status,
-      type: t.type || "long",
-      pnl: t.pnl, pnlPct: t.pnlPct, holdingDays: t.holdingDays,
-      openDate: t.openDate, closeDate: t.closeDate,
-      avgBuyPrice: t.avgBuyPrice, totalBuyCost: t.totalBuyCost,
-      avgSellPrice: t.avgSellPrice, totalSellProceeds: t.totalSellProceeds,
-      remainingQty: t.remainingQty, totalBuyQty: t.totalBuyQty, totalSellQty: t.totalSellQty,
-      patternId: t.patternId || "", marketTags: t.marketTags || [], tags: t.tags || [],
-    }));
-
-    setTradesIndex(prev => {
-      const next = [...prev, ...newIndexEntries];
-      fsSaveTradesIndex(userId, next);
-      return next;
+    // Finalize updated trades
+    const mergedCount = Object.keys(updatedTrades).length;
+    Object.entries(updatedTrades).forEach(([id, { trade }]) => {
+      const finalized = finalizeTrade(trade);
+      saveTradeFn(finalized);
     });
-    setTradeStore(prev => {
-      const next = { ...prev };
-      toImport.forEach(t => { next[t.id] = t; });
-      return next;
-    });
-    toImport.forEach(t => fsSaveTrade(userId, t));
 
-    return toImport.length;
+    // Phase 2: Build new trades from unmatched transactions
+    const brandNewTrades = unmatchedTxns.length > 0 ? buildTradesFromTxns(unmatchedTxns) : [];
+
+    if (brandNewTrades.length > 0) {
+      const newIndexEntries = brandNewTrades.map(t => ({
+        id: t.id, ticker: t.ticker, name: t.name, currency: t.currency, status: t.status,
+        type: t.type || "long",
+        pnl: t.pnl, pnlPct: t.pnlPct, holdingDays: t.holdingDays,
+        openDate: t.openDate, closeDate: t.closeDate,
+        avgBuyPrice: t.avgBuyPrice, totalBuyCost: t.totalBuyCost,
+        avgSellPrice: t.avgSellPrice, totalSellProceeds: t.totalSellProceeds,
+        remainingQty: t.remainingQty, totalBuyQty: t.totalBuyQty, totalSellQty: t.totalSellQty,
+        patternId: t.patternId || "", marketTags: t.marketTags || [], tags: t.tags || [],
+      }));
+
+      setTradesIndex(prev => {
+        const next = [...prev, ...newIndexEntries];
+        fsSaveTradesIndex(userId, next);
+        return next;
+      });
+      setTradeStore(prev => {
+        const next = { ...prev };
+        brandNewTrades.forEach(t => { next[t.id] = t; });
+        return next;
+      });
+      brandNewTrades.forEach(t => fsSaveTrade(userId, t));
+    }
+
+    const totalImported = mergedCount + brandNewTrades.length;
+    if (mergedCount > 0) showToast(`${mergedCount} 筆併入現有部位，${brandNewTrades.length} 筆新交易`);
+    return totalImported;
   };
 
   const getPattern = (id) => patterns.find(p => p.id === id);
@@ -2666,6 +2739,8 @@ function TradesView({ tradesIndex, tradeStore, loadTrade, patterns, topPatterns,
   const [customTo, setCustomTo] = useState("");
   const [patFilter, setPatFilter] = useState("");
   const [mktFilter, setMktFilter] = useState("");
+  const [livePrices, setLivePrices] = useState({});
+  const [priceLoading, setPriceLoading] = useState(false);
   const fileRef = useRef();
 
   const patternOptions = useMemo(() => {
@@ -2707,6 +2782,34 @@ function TradesView({ tradesIndex, tradeStore, loadTrade, patterns, topPatterns,
   }, [allClosed, dateRange, patFilter, mktFilter, patterns]);
 
   const openTrades = useMemo(() => tradesIndex.filter(t => t.status === "open"), [tradesIndex]);
+
+  // Fetch live prices for open positions
+  useEffect(() => {
+    if (openTrades.length === 0) return;
+    let cancelled = false;
+    setPriceLoading(true);
+    const tickers = [...new Set(openTrades.map(t => t.ticker))];
+    Promise.all(tickers.map(tk => fetchStockPrice(tk).then(snap => [tk, snap]))).then(results => {
+      if (cancelled) return;
+      const prices = {};
+      results.forEach(([tk, snap]) => { if (snap) prices[tk] = snap; });
+      setLivePrices(prices);
+      setPriceLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [openTrades.length]);
+
+  const refreshPrices = () => {
+    setPriceLoading(true);
+    const tickers = [...new Set(openTrades.map(t => t.ticker))];
+    Promise.all(tickers.map(tk => fetchStockPrice(tk).then(snap => [tk, snap]))).then(results => {
+      const prices = {};
+      results.forEach(([tk, snap]) => { if (snap) prices[tk] = snap; });
+      setLivePrices(prices);
+      setPriceLoading(false);
+      showToast("報價已更新");
+    });
+  };
 
   const stats = useMemo(() => {
     if (filtered.length === 0) return null;
@@ -2864,27 +2967,50 @@ function TradesView({ tradesIndex, tradeStore, loadTrade, patterns, topPatterns,
       {/* Open trades */}
       {openTrades.length > 0 && (
         <div style={S.card}>
-          <div style={S.h3}>未平倉部位 ({openTrades.length})</div>
+          <div style={S.flexBetween}>
+            <div style={S.h3}>未平倉部位 ({openTrades.length})</div>
+            <div style={S.flexGap(6)}>
+              {priceLoading && <span style={{ fontSize: 11, color: "#94A3B8" }}>報價載入中...</span>}
+              <button style={{ ...S.btnOutline, padding: "3px 10px", fontSize: 11 }} onClick={refreshPrices}>🔄 更新報價</button>
+            </div>
+          </div>
           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12.5 }}>
             <thead><tr style={{ borderBottom: "1px solid #E2E8F0" }}>
               <th style={{ textAlign: "left", padding: "7px 6px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>股票</th>
               <th style={{ textAlign: "right", padding: "7px 6px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>均價</th>
-              <th style={{ textAlign: "right", padding: "7px 6px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>剩餘股數</th>
+              <th style={{ textAlign: "right", padding: "7px 6px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>現價</th>
+              <th style={{ textAlign: "right", padding: "7px 6px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>股數</th>
+              <th style={{ textAlign: "right", padding: "7px 6px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>未實現損益</th>
+              <th style={{ textAlign: "right", padding: "7px 6px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>報酬率</th>
               <th style={{ textAlign: "left", padding: "7px 6px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>開倉日</th>
-              <th style={{ textAlign: "right", padding: "7px 6px", color: "#94A3B8", fontWeight: 500, fontSize: 11 }}>已實現損益</th>
               <th style={{ padding: "7px 6px" }}></th>
             </tr></thead>
             <tbody>
-              {openTrades.map(t => (
-                <tr key={t.id} style={{ borderBottom: "1px solid #F1F5F9", cursor: "pointer" }} onClick={() => onOpenTrade(t.id)}>
-                  <td style={{ padding: "8px 6px" }}><div style={S.flexGap(6)}><span style={{ fontWeight: 600 }}>{t.ticker}</span><span style={{ display: "inline-block", padding: "1px 7px", borderRadius: 4, fontSize: 10, fontWeight: 600, background: (t.type || "long") === "short" ? "#FEE2E2" : "#ECFDF5", color: (t.type || "long") === "short" ? "#DC2626" : "#059669" }}>{(t.type || "long") === "short" ? "Short" : "Long"}</span></div></td>
-                  <td style={{ padding: "8px 6px", textAlign: "right" }}>${t.avgBuyPrice}</td>
-                  <td style={{ padding: "8px 6px", textAlign: "right" }}>{t.remainingQty}</td>
-                  <td style={{ padding: "8px 6px" }}>{t.openDate}</td>
-                  <td style={{ padding: "8px 6px", textAlign: "right", fontWeight: 600, color: t.pnl >= 0 ? "#059669" : "#DC2626" }}>{fmtMoney(t.pnl)}</td>
-                  <td style={{ padding: "8px 6px", textAlign: "right", color: "#4F46E5", fontSize: 11 }}>詳情 →</td>
-                </tr>
-              ))}
+              {openTrades.map(t => {
+                const snap = livePrices[t.ticker];
+                const curPrice = snap ? (snap.close || snap.price || snap.last) : null;
+                const isShort = (t.type || "long") === "short";
+                const avgPrice = t.avgBuyPrice || 0;
+                const qty = t.remainingQty || 0;
+                let unrealizedPnl = null, unrealizedPct = null;
+                if (curPrice && avgPrice > 0) {
+                  unrealizedPnl = isShort ? (avgPrice - curPrice) * qty : (curPrice - avgPrice) * qty;
+                  unrealizedPnl -= (t.totalCommission || 0);
+                  unrealizedPct = isShort ? ((avgPrice - curPrice) / avgPrice) * 100 : ((curPrice - avgPrice) / avgPrice) * 100;
+                }
+                return (
+                  <tr key={t.id} style={{ borderBottom: "1px solid #F1F5F9", cursor: "pointer" }} onClick={() => onOpenTrade(t.id)}>
+                    <td style={{ padding: "8px 6px" }}><div style={S.flexGap(6)}><span style={{ fontWeight: 600 }}>{t.ticker}</span><span style={{ display: "inline-block", padding: "1px 7px", borderRadius: 4, fontSize: 10, fontWeight: 600, background: isShort ? "#FEE2E2" : "#ECFDF5", color: isShort ? "#DC2626" : "#059669" }}>{isShort ? "Short" : "Long"}</span></div></td>
+                    <td style={{ padding: "8px 6px", textAlign: "right" }}>${avgPrice.toFixed(2)}</td>
+                    <td style={{ padding: "8px 6px", textAlign: "right", fontWeight: 600, color: curPrice ? "#334155" : "#CBD5E1" }}>{curPrice ? "$" + curPrice.toFixed(2) : "—"}</td>
+                    <td style={{ padding: "8px 6px", textAlign: "right" }}>{qty}</td>
+                    <td style={{ padding: "8px 6px", textAlign: "right", fontWeight: 600, color: unrealizedPnl !== null ? (unrealizedPnl >= 0 ? "#059669" : "#DC2626") : "#CBD5E1" }}>{unrealizedPnl !== null ? fmtMoney(Math.round(unrealizedPnl * 100) / 100) : "—"}</td>
+                    <td style={{ padding: "8px 6px", textAlign: "right", fontWeight: 600, color: unrealizedPct !== null ? (unrealizedPct >= 0 ? "#059669" : "#DC2626") : "#CBD5E1" }}>{unrealizedPct !== null ? (unrealizedPct >= 0 ? "+" : "") + unrealizedPct.toFixed(2) + "%" : "—"}</td>
+                    <td style={{ padding: "8px 6px" }}>{t.openDate}</td>
+                    <td style={{ padding: "8px 6px", textAlign: "right", color: "#4F46E5", fontSize: 11 }}>詳情 →</td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
