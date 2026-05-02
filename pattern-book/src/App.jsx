@@ -791,46 +791,56 @@ function StockDatabook({ userId }) {
     fsSaveCapitalHistory(userId, sorted);
   };
 
-  const importTlg = (text) => {
+  const importTlg = async (text) => {
     const txns = parseTlg(text);
     if (txns.length === 0) { showToast("未找到交易紀錄"); return 0; }
 
+    // Load ALL existing trades from Firestore (not just what's in tradeStore)
+    const allFullTrades = {};
+    await Promise.all(tradesIndex.map(async (t) => {
+      if (tradeStore[t.id]) {
+        allFullTrades[t.id] = tradeStore[t.id];
+      } else {
+        const loaded = await fsLoadTrade(userId, t.id);
+        if (loaded) allFullTrades[t.id] = loaded;
+      }
+    }));
+
+    // Update tradeStore with loaded trades
+    setTradeStore(prev => ({ ...prev, ...allFullTrades }));
+
     // Collect all existing transaction IDs for dedup
     const existingTxnIds = new Set();
-    tradesIndex.forEach(t => {
-      const full = tradeStore[t.id];
-      if (full) {
-        (full.buys || []).forEach(b => existingTxnIds.add(b.tradeId));
-        (full.sells || []).forEach(s => existingTxnIds.add(s.tradeId));
-      }
+    Object.values(allFullTrades).forEach(full => {
+      (full.buys || []).forEach(b => existingTxnIds.add(b.tradeId));
+      (full.sells || []).forEach(s => existingTxnIds.add(s.tradeId));
     });
 
     // Filter out already-imported transactions
     const newTxns = txns.filter(t => !existingTxnIds.has(t.tradeId));
-    if (newTxns.length === 0) return 0;
+    if (newTxns.length === 0) { showToast("所有交易已存在，無需匯入"); return 0; }
 
     // Phase 1: Try to merge into existing open positions
     const unmatchedTxns = [];
-    const updatedTrades = {}; // id -> updated trade
+    const updatedTrades = {};
 
     newTxns.forEach(txn => {
       // Find existing open position with same ticker
       const openIdx = tradesIndex.find(t =>
-        t.status === "open" && t.ticker === txn.ticker && !updatedTrades[t.id]?.merged
+        t.status === "open" && t.ticker === txn.ticker && !updatedTrades[t.id]
       );
-      // Also check trades we've already started updating in this batch
-      const openEntry = openIdx || Object.values(updatedTrades).find(u =>
-        u.trade.status === "open" && u.trade.ticker === txn.ticker
-      );
+      const updatedOpen = !openIdx ? Object.values(updatedTrades).find(u =>
+        u.trade.ticker === txn.ticker && u.trade.status !== "closed"
+      ) : null;
+      const matchId = openIdx ? openIdx.id : updatedOpen ? updatedOpen.trade.id : null;
 
-      if (openEntry) {
-        const tradeId = openIdx ? openIdx.id : openEntry.trade.id;
-        if (!updatedTrades[tradeId]) {
-          const full = tradeStore[tradeId];
+      if (matchId) {
+        if (!updatedTrades[matchId]) {
+          const full = allFullTrades[matchId];
           if (!full) { unmatchedTxns.push(txn); return; }
-          updatedTrades[tradeId] = { trade: JSON.parse(JSON.stringify(full)), merged: false };
+          updatedTrades[matchId] = { trade: JSON.parse(JSON.stringify(full)) };
         }
-        const ut = updatedTrades[tradeId];
+        const ut = updatedTrades[matchId];
         const fmtDate = fmtTlgDate(txn.date);
 
         if (txn.action === "BUYTOOPEN") {
@@ -840,7 +850,6 @@ function StockDatabook({ userId }) {
             amount: Math.abs(txn.amount), commission: txn.commission, exchange: txn.exchange,
           });
         } else if (txn.action === "SELLTOCLOSE") {
-          // FIFO cost basis from all buys minus already sold
           const fifoLots = ut.trade.buys.map(b => ({ price: b.price, qty: b.quantity }));
           const soldBefore = ut.trade.sells.reduce((s, s2) => s + s2.quantity, 0);
           let skip = soldBefore;
@@ -855,7 +864,6 @@ function StockDatabook({ userId }) {
           }
           const grossPnl = txn.quantity * txn.price - costBasis;
           const pnlPctVal = costBasis > 0 ? (grossPnl / costBasis) * 100 : 0;
-
           ut.trade.sells.push({
             tradeId: txn.tradeId, date: fmtDate, time: txn.time,
             price: txn.price, quantity: txn.quantity,
@@ -863,13 +871,12 @@ function StockDatabook({ userId }) {
             pnl: Math.round(grossPnl * 100) / 100, pnlPct: Math.round(pnlPctVal * 100) / 100,
           });
         }
-        ut.merged = true;
       } else {
         unmatchedTxns.push(txn);
       }
     });
 
-    // Finalize updated trades
+    // Finalize and save updated trades
     const mergedCount = Object.keys(updatedTrades).length;
     Object.entries(updatedTrades).forEach(([id, { trade }]) => {
       const finalized = finalizeTrade(trade);
@@ -905,7 +912,10 @@ function StockDatabook({ userId }) {
     }
 
     const totalImported = mergedCount + brandNewTrades.length;
-    if (mergedCount > 0) showToast(`${mergedCount} 筆併入現有部位，${brandNewTrades.length} 筆新交易`);
+    showToast(mergedCount > 0
+      ? `${mergedCount} 筆併入現有部位，${brandNewTrades.length} 筆新交易`
+      : `匯入了 ${brandNewTrades.length} 筆交易`
+    );
     return totalImported;
   };
 
@@ -2892,9 +2902,8 @@ function TradesView({ tradesIndex, tradeStore, loadTrade, patterns, topPatterns,
     const file = e.target.files[0];
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = (ev) => {
-      const count = onImport(ev.target.result);
-      showToast(`匯入了 ${count} 筆交易`);
+    reader.onload = async (ev) => {
+      await onImport(ev.target.result);
     };
     reader.readAsText(file);
     e.target.value = "";
