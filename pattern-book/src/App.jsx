@@ -743,6 +743,7 @@ function StockDatabook({ userId }) {
       avgSellPrice: t.avgSellPrice, totalSellProceeds: t.totalSellProceeds,
       remainingQty: t.remainingQty, totalBuyQty: t.totalBuyQty, totalSellQty: t.totalSellQty,
       patternId: t.patternId || "", marketTags: t.marketTags || [], tags: t.tags || [],
+      evaluation: t.evaluation || "",
     };
     setTradesIndex(prev => {
       const next = prev.find(x => x.id === t.id) ? prev.map(x => x.id === t.id ? indexEntry : x) : [...prev, indexEntry];
@@ -896,6 +897,7 @@ function StockDatabook({ userId }) {
         avgSellPrice: t.avgSellPrice, totalSellProceeds: t.totalSellProceeds,
         remainingQty: t.remainingQty, totalBuyQty: t.totalBuyQty, totalSellQty: t.totalSellQty,
         patternId: t.patternId || "", marketTags: t.marketTags || [], tags: t.tags || [],
+        evaluation: t.evaluation || "",
       }));
 
       setTradesIndex(prev => {
@@ -2749,6 +2751,7 @@ function TradesView({ tradesIndex, tradeStore, loadTrade, patterns, topPatterns,
   const [customTo, setCustomTo] = useState("");
   const [patFilter, setPatFilter] = useState("");
   const [mktFilter, setMktFilter] = useState("");
+  const [evalFilter, setEvalFilter] = useState("");
   const [livePrices, setLivePrices] = useState({});
   const [priceLoading, setPriceLoading] = useState(false);
   const fileRef = useRef();
@@ -2788,8 +2791,9 @@ function TradesView({ tradesIndex, tradeStore, loadTrade, patterns, topPatterns,
       list = list.filter(t => allIds.includes(t.patternId));
     }
     if (mktFilter) list = list.filter(t => (t.marketTags || []).includes(mktFilter));
+    if (evalFilter) list = list.filter(t => (t.evaluation || "") === evalFilter);
     return list;
-  }, [allClosed, dateRange, patFilter, mktFilter, patterns]);
+  }, [allClosed, dateRange, patFilter, mktFilter, evalFilter, patterns]);
 
   const openTrades = useMemo(() => tradesIndex.filter(t => t.status === "open"), [tradesIndex]);
 
@@ -2944,6 +2948,7 @@ function TradesView({ tradesIndex, tradeStore, loadTrade, patterns, topPatterns,
         </>}
         <div><label style={S.label}>型態分類</label><select style={{ ...S.select, width: 150 }} value={patFilter} onChange={e => setPatFilter(e.target.value)}><option value="">全部型態</option>{patternOptions.map(o => <option key={o.id} value={o.id}>{o.label}</option>)}</select></div>
         <div><label style={S.label}>市場標籤</label><select style={{ ...S.select, width: 150 }} value={mktFilter} onChange={e => setMktFilter(e.target.value)}><option value="">全部標籤</option>{allMktTags.map(t => <option key={t} value={t}>{t}</option>)}</select></div>
+        <div><label style={S.label}>交易評價</label><select style={{ ...S.select, width: 130 }} value={evalFilter} onChange={e => setEvalFilter(e.target.value)}><option value="">全部</option><option value="good">✅ Good Trade</option><option value="bad">❌ Bad Trade</option></select></div>
       </div>
 
       {/* Stats cards - 3 ratios */}
@@ -3049,7 +3054,7 @@ function TradesView({ tradesIndex, tradeStore, loadTrade, patterns, topPatterns,
                 const posPct = getPositionSize(t);
                 return (
                   <tr key={t.id} style={{ borderBottom: "1px solid #F1F5F9", cursor: "pointer" }} onClick={() => onOpenTrade(t.id)}>
-                    <td style={{ padding: "8px 6px" }}><div style={S.flexGap(6)}>{p && <Dot color={p.color} size={7} />}<span style={{ fontWeight: 600 }}>{t.ticker}</span><span style={{ display: "inline-block", padding: "1px 7px", borderRadius: 4, fontSize: 10, fontWeight: 600, background: (t.type || "long") === "short" ? "#FEE2E2" : "#ECFDF5", color: (t.type || "long") === "short" ? "#DC2626" : "#059669" }}>{(t.type || "long") === "short" ? "Short" : "Long"}</span></div></td>
+                    <td style={{ padding: "8px 6px" }}><div style={S.flexGap(6)}>{p && <Dot color={p.color} size={7} />}<span style={{ fontWeight: 600 }}>{t.ticker}</span><span style={{ display: "inline-block", padding: "1px 7px", borderRadius: 4, fontSize: 10, fontWeight: 600, background: (t.type || "long") === "short" ? "#FEE2E2" : "#ECFDF5", color: (t.type || "long") === "short" ? "#DC2626" : "#059669" }}>{(t.type || "long") === "short" ? "Short" : "Long"}</span>{t.evaluation === "good" && <span style={{ fontSize: 11 }}>✅</span>}{t.evaluation === "bad" && <span style={{ fontSize: 11 }}>❌</span>}</div></td>
                     <td style={{ padding: "8px 6px", textAlign: "right", fontWeight: 600, color: t.pnl >= 0 ? "#059669" : "#DC2626" }}>{fmtMoney(t.pnl)}</td>
                     <td style={{ padding: "8px 6px", textAlign: "right", fontWeight: 600, color: (t.pnlPct || 0) >= 0 ? "#059669" : "#DC2626" }}>{((t.pnlPct || 0) >= 0 ? "+" : "") + (t.pnlPct || 0).toFixed(2)}%</td>
                     <td style={{ padding: "8px 6px", textAlign: "right", color: "#64748B" }}>{posPct !== null ? posPct.toFixed(1) + "%" : "—"}</td>
@@ -3122,6 +3127,7 @@ function TradeDetailView({ tradeId, tradeStore, loadTradeFn, setTradeStore, trad
   const [editing, setEditing] = useState(false);
   const [notes, setNotes] = useState("");
   const [patternId, setPatternId] = useState("");
+  const [evaluation, setEvaluation] = useState("");
   const [marketTags, setMarketTags] = useState([]);
   const [images, setImages] = useState([]);
   const [mktTagInput, setMktTagInput] = useState("");
@@ -3157,6 +3163,7 @@ function TradeDetailView({ tradeId, tradeStore, loadTradeFn, setTradeStore, trad
     if (trade) {
       setNotes(trade.notes || "");
       setPatternId(trade.patternId || "");
+      setEvaluation(trade.evaluation || "");
       setMarketTags(trade.marketTags || []);
       setImages(trade.images || []);
       setLocalBuys(trade.buys || []);
@@ -3214,7 +3221,7 @@ function TradeDetailView({ tradeId, tradeStore, loadTradeFn, setTradeStore, trad
       sells.push({ tradeId: genId(), date: newSell.date, time: "00:00:00", price, quantity: qty, amount: qty * price, commission: 0, exchange: "MANUAL", pnl: Math.round(pnlVal * 100) / 100, pnlPct: Math.round(pnlPctVal * 100) / 100 });
       setNewSell(null);
     }
-    const updated = finalizeTrade({ ...trade, buys, sells, notes, patternId, marketTags, images, tags });
+    const updated = finalizeTrade({ ...trade, buys, sells, notes, patternId, evaluation, marketTags, images, tags });
     setTrade(updated);
     onSave(updated);
     setEditing(false);
@@ -3264,6 +3271,8 @@ function TradeDetailView({ tradeId, tradeStore, loadTradeFn, setTradeStore, trad
         </div>
         <div style={{ marginTop: 8, ...S.flexGap(6), flexWrap: "wrap" }}>
           {pat && <span style={S.tag(pat.color + "22", pat.color)}>{getPatternLabel(pat, patterns)}</span>}
+          {evaluation === "good" && <span style={S.tag("#DCFCE7", "#16A34A")}>✅ Good Trade</span>}
+          {evaluation === "bad" && <span style={S.tag("#FEE2E2", "#DC2626")}>❌ Bad Trade</span>}
           {marketTags.map(t => <span key={t} style={S.tag("#FEF3C7", "#92400E")}>📌 {t}</span>)}
         </div>
         <div style={{ marginTop: 10, display: "grid", gridTemplateColumns: "repeat(6, 1fr)", gap: 8 }}>
@@ -3354,6 +3363,7 @@ function TradeDetailView({ tradeId, tradeStore, loadTradeFn, setTradeStore, trad
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
           <div>
             <div style={S.card}><div style={S.h3}>型態分類</div><select style={S.select} value={patternId} onChange={e => setPatternId(e.target.value)}><option value="">未分類</option>{patternOptions.map(o => <option key={o.id} value={o.id}>{o.label}</option>)}</select></div>
+            <div style={S.card}><div style={S.h3}>交易評價</div><select style={S.select} value={evaluation} onChange={e => setEvaluation(e.target.value)}><option value="">未評價</option><option value="good">✅ Good Trade — 遵照系統</option><option value="bad">❌ Bad Trade — 未遵照系統</option></select></div>
             <div style={S.card}>
               <div style={S.h3}>市場標籤</div>
               <div ref={sugRef} style={{ position: "relative" }}>
@@ -3405,6 +3415,7 @@ function TradeStatsView({ tradesIndex, tradeStore, loadTrade, patterns, topPatte
   const [customTo, setCustomTo] = useState("");
   const [patFilter, setPatFilter] = useState("");
   const [mktFilter, setMktFilter] = useState("");
+  const [evalFilter, setEvalFilter] = useState("");
 
   const patternOptions = useMemo(() => {
     const opts = [];
@@ -3430,8 +3441,9 @@ function TradeStatsView({ tradesIndex, tradeStore, loadTrade, patterns, topPatte
     if (dateRange.to) list = list.filter(t => t.closeDate <= dateRange.to);
     if (patFilter) { const allIds = getDescendantIds(patFilter, patterns); list = list.filter(t => allIds.includes(t.patternId)); }
     if (mktFilter) list = list.filter(t => (t.marketTags || []).includes(mktFilter));
+    if (evalFilter) list = list.filter(t => (t.evaluation || "") === evalFilter);
     return list.sort((a, b) => a.closeDate.localeCompare(b.closeDate));
-  }, [tradesIndex, dateRange, patFilter, mktFilter, patterns]);
+  }, [tradesIndex, dateRange, patFilter, mktFilter, evalFilter, patterns]);
 
   const wins = closed.filter(t => t.pnl > 0);
   const losses = closed.filter(t => t.pnl <= 0);
@@ -3577,6 +3589,7 @@ function TradeStatsView({ tradesIndex, tradeStore, loadTrade, patterns, topPatte
         {period === "custom" && <><div><label style={S.label}>起始</label><input type="date" style={{ ...S.input, width: 140 }} value={customFrom} onChange={e => setCustomFrom(e.target.value)} /></div><div><label style={S.label}>結束</label><input type="date" style={{ ...S.input, width: 140 }} value={customTo} onChange={e => setCustomTo(e.target.value)} /></div></>}
         <div><label style={S.label}>型態分類</label><select style={{ ...S.select, width: 150 }} value={patFilter} onChange={e => setPatFilter(e.target.value)}><option value="">全部</option>{patternOptions.map(o => <option key={o.id} value={o.id}>{o.label}</option>)}</select></div>
         <div><label style={S.label}>市場標籤</label><select style={{ ...S.select, width: 150 }} value={mktFilter} onChange={e => setMktFilter(e.target.value)}><option value="">全部</option>{allMktTags.map(t => <option key={t} value={t}>{t}</option>)}</select></div>
+        <div><label style={S.label}>交易評價</label><select style={{ ...S.select, width: 130 }} value={evalFilter} onChange={e => setEvalFilter(e.target.value)}><option value="">全部</option><option value="good">✅ Good Trade</option><option value="bad">❌ Bad Trade</option></select></div>
       </div>
       {totalTrades === 0 ? (<div style={{ ...S.card, textAlign: "center", padding: 36, color: "#94A3B8" }}>該期間無已平倉交易</div>) : (
         <>
